@@ -54,7 +54,7 @@ ATTACH_OPTS = ["--tray=no", "--splash=no", "--reconnect=no"]
 
 # ───────────────────────── утилиты ─────────────────────────
 
-class WinhopError(Exception):
+class WindriftError(Exception):
     pass
 
 
@@ -71,7 +71,7 @@ def notify(msg: str) -> None:
 def run_out(cmd: list[str], timeout: float = 5) -> str:
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
-        raise WinhopError(f"{shlex.join(cmd)} → {r.stderr.strip() or r.returncode}")
+        raise WindriftError(f"{shlex.join(cmd)} → {r.stderr.strip() or r.returncode}")
     return r.stdout
 
 
@@ -85,15 +85,15 @@ def spawn_detached(cmd: list[str], env: dict | None = None) -> int:
 
 def load_config(path: Path = CONFIG_PATH) -> dict:
     if not path.exists():
-        raise WinhopError(f"нет конфига {path} (см. config.example.toml)")
+        raise WindriftError(f"нет конфига {path} (см. config.example.toml)")
     with open(path, "rb") as f:
         cfg = tomllib.load(f)
     for key in ("name", "token", "peer"):
         if key not in cfg:
-            raise WinhopError(f"в конфиге нет обязательного поля '{key}'")
+            raise WindriftError(f"в конфиге нет обязательного поля '{key}'")
     for key in ("name", "host", "ssh"):
         if key not in cfg["peer"]:
-            raise WinhopError(f"в [peer] нет обязательного поля '{key}'")
+            raise WindriftError(f"в [peer] нет обязательного поля '{key}'")
     cfg.setdefault("port", DEFAULT_PORT)
     cfg.setdefault("listen", "0.0.0.0")
     cfg.setdefault("backend", "hyprland")
@@ -134,13 +134,13 @@ def attach_cmd(cfg: dict, owner: str, display: int) -> list[str]:
     elif owner == cfg["peer"]["name"]:
         spec = f"ssh://{cfg['peer']['ssh']}/{display}"         # напрямую к владельцу
     else:
-        raise WinhopError(f"неизвестный владелец '{owner}'")
+        raise WindriftError(f"неизвестный владелец '{owner}'")
     return ["xpra", "attach", spec, *ATTACH_OPTS]
 
 
 def cmd_run(cfg: dict, argv: list[str]) -> None:
     if not argv:
-        raise WinhopError("укажи программу: windrift run firefox")
+        raise WindriftError("укажи программу: windrift run firefox")
     reg = registry_load()
     n = free_display(reg)
     env = os.environ.copy()
@@ -198,8 +198,8 @@ def focused_pid(backend: str) -> int:
             if node.get("focused") and node.get("pid"):
                 return int(node["pid"])
             stack += node.get("nodes", []) + node.get("floating_nodes", [])
-        raise WinhopError("sway: активное окно не найдено")
-    raise WinhopError(f"неизвестный backend '{backend}' (hyprland | kde | sway)")
+        raise WindriftError("sway: активное окно не найдено")
+    raise WindriftError(f"неизвестный backend '{backend}' (hyprland | kde | sway)")
 
 
 def parse_attach_args(cfg: dict, args: list[str]) -> tuple[str, int] | None:
@@ -237,7 +237,7 @@ def window_session(cfg: dict, pid: int) -> tuple[str, int]:
         if found:
             return found
         pid = proc_ppid(pid)
-    raise WinhopError("активное окно не из windrift — запускай программы через `windrift run`")
+    raise WindriftError("активное окно не из windrift — запускай программы через `windrift run`")
 
 
 # ───────────────────────── сеть между демонами ─────────────────────────
@@ -249,7 +249,7 @@ def send_peer(cfg: dict, msg: dict, timeout: float = 5) -> dict:
         s.sendall(payload.encode())
         reply = s.makefile().readline()
     if not reply:
-        raise WinhopError("сосед закрыл соединение")
+        raise WindriftError("сосед закрыл соединение")
     return json.loads(reply)
 
 
@@ -259,7 +259,7 @@ def cmd_send(cfg: dict) -> None:
     log(f"окно pid={pid}: сессия :{display}, владелец {owner} → отправляю на {cfg['peer']['name']}")
     reply = send_peer(cfg, {"cmd": "attach", "owner": owner, "display": display})
     if not reply.get("ok"):
-        raise WinhopError(f"сосед отказал: {reply.get('error')}")
+        raise WindriftError(f"сосед отказал: {reply.get('error')}")
     # Локальный клиент отключится сам: xpra-сервер с sharing=no вытеснит его.
 
 
@@ -299,7 +299,7 @@ class Clipboard:
                 try:
                     await asyncio.to_thread(send_peer, self.cfg,
                                             {"cmd": "clip", "data": data.decode(errors="replace")})
-                except (OSError, WinhopError) as e:
+                except (OSError, WindriftError) as e:
                     log(f"буфер не отправлен: {e}")
             await asyncio.sleep(0.5)
 
@@ -312,7 +312,7 @@ async def handle(reader, writer, cfg: dict, clip: Clipboard | None) -> None:
         line = await asyncio.wait_for(reader.readline(), timeout=5)
         msg = json.loads(line)
         if not hmac.compare_digest(str(msg.get("token", "")), cfg["token"]):
-            raise WinhopError("неверный token")
+            raise WindriftError("неверный token")
         cmd = msg.get("cmd")
         if cmd == "ping":
             reply = {"ok": True, "name": cfg["name"]}
@@ -326,7 +326,7 @@ async def handle(reader, writer, cfg: dict, clip: Clipboard | None) -> None:
                 clip.set_from_peer(msg["data"])
             reply = {"ok": True}
         else:
-            raise WinhopError(f"неизвестная команда {cmd}")
+            raise WindriftError(f"неизвестная команда {cmd}")
     except Exception as e:  # noqa: BLE001 — демон не должен падать
         log(f"ошибка от {peer_addr}: {e}")
         reply = {"ok": False, "error": str(e)}
@@ -398,7 +398,7 @@ def main() -> None:
             case "list": cmd_list(cfg)
             case "stop": cmd_stop(cfg, a.display)
             case "doctor": cmd_doctor(cfg)
-    except (WinhopError, OSError, subprocess.CalledProcessError) as e:
+    except (WindriftError, OSError, subprocess.CalledProcessError) as e:
         notify(f"ошибка: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
