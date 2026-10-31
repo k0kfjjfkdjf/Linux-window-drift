@@ -46,13 +46,18 @@
 ## Установка (на обеих машинах)
 
 ```bash
-sudo pacman -S xpra wl-clipboard python openssh libnotify
+sudo pacman -S git xpra wl-clipboard python openssh libnotify
+git clone https://github.com/k0kfjjfkdjf/Linux-window-drift.git ~/Linux-window-drift
+cd ~/Linux-window-drift
 install -Dm755 windrift ~/.local/bin/windrift
 mkdir -p ~/.config/windrift && cp config.example.toml ~/.config/windrift/config.toml
-$EDITOR ~/.config/windrift/config.toml      # name, peer, одинаковый token
+nano ~/.config/windrift/config.toml   # name, peer и одинаковый token (openssl rand -hex 32)
 ```
 
-Для KDE дополнительно нужен `kdotool` (AUR).
+- `~/.local/bin` должен быть в `PATH` (в fish: `fish_add_path ~/.local/bin`).
+- Для KDE дополнительно нужен `kdotool` (AUR).
+- По желанию: `gst-python` (звук из перенесённых окон), `python-cryptography` (шифрование xpra).
+- Системные часы должны быть точными, иначе ssh и TLS могут сбоить: `sudo timedatectl set-ntp true`.
 
 ### Запуск демона
 
