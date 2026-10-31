@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=windrift
+Name[ru]=windrift — настройки
+Comment=Settings for moving live windows between two Linux machines
+Comment[ru]=Настройки переноса окон между двумя машинами
+Exec=windrift settings
+Icon=preferences-system-network
+Terminal=false
+Categories=Settings;Network;

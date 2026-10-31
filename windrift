@@ -1,46 +1,83 @@
 #!/usr/bin/env python3
 """
-windrift — прототип переноса живых окон между двумя Linux-машинами.
+windrift — перенос живых окон между двумя Linux-машинами.
 
-Идея: каждая программа запускается внутри собственного xpra-сервера на
+Каждая программа запускается внутри собственного xpra-сервера на
 "машине-владельце" и по умолчанию показывается локально. Команда `send`
 подключает клиента на соседней машине НАПРЯМУЮ к владельцу (xpra с
 sharing=no сам отключает старого клиента). Цепочек не бывает: подключение
 всегда идёт к владельцу, а если владелец — сама целевая машина, то через
-локальный unix-сокет без сети.
+локальный сокет без сети.
 
 Команды:
-  windrift run <cmd...>   запустить программу в переносимой сессии
-  windrift send           отправить активное окно на соседнюю машину
-  windrift daemon         демон: принимает окна и синхронизирует буфер обмена
-  windrift list           показать локальные сессии
-  windrift stop <N>       остановить сессию :N
-  windrift doctor         проверить зависимости и связь с соседом
+  windrift init                 создать конфиг со всеми настройками
+  windrift settings             окно настроек (GTK4)
+  windrift setup-peer [ssh]     установить и настроить windrift на соседе по SSH
+  windrift run <cmd...>         запустить программу в переносимой сессии
+  windrift send                 отправить активное окно на соседнюю машину
+  windrift daemon               демон: принимает окна и синхронизирует буфер обмена
+  windrift list                 показать локальные сессии
+  windrift stop <N>             остановить сессию :N
+  windrift doctor               проверить зависимости и связь с соседом
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
+import getpass
 import hashlib
 import hmac
 import json
 import os
+import secrets
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from pathlib import Path
 
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "windrift" / "config.toml"
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/windrift-{os.getuid()}")) / "windrift"
-DISPLAY_BASE = 100
-DEFAULT_PORT = 7781
+REPO_URL = "https://github.com/k0kfjjfkdjf/Linux-window-drift.git"
+BACKENDS = ["hyprland", "kde", "sway"]
+ENCODINGS = ["auto", "rgb", "png", "jpeg", "webp", "h264", "vp8", "vp9"]
 
-# Внутри xpra-сессии программы должны работать через X11, а не лезть
-# напрямую в Wayland-композитор — иначе окно не будет переносимым.
+# Все настройки и их значения по умолчанию. Конфиг накладывается поверх.
+DEFAULTS: dict = {
+    "name": "",
+    "token": "",
+    "port": 7781,
+    "listen": "0.0.0.0",
+    "backend": "hyprland",
+    "notify": True,
+    "clipboard": True,
+    "clipboard_interval": 0.5,
+    "clipboard_max_kb": 1024,
+    "peer": {"name": "", "host": "", "port": 7781, "ssh": ""},
+    "xpra": {
+        "display_base": 100,
+        "encoding": "auto",
+        "quality": 0,
+        "speaker": False,
+        "microphone": False,
+        "server_args": [],
+        "attach_args": [],
+    },
+    "setup": {
+        "repo": REPO_URL,
+        "dir": "~/Linux-window-drift",
+        "packages": ["git", "xpra", "wl-clipboard", "python", "openssh", "libnotify",
+                     "python-gobject", "gtk4"],
+    },
+}
+
+# Внутри xpra-сессии программы работают через X11, а не лезут напрямую
+# в Wayland-композитор — иначе окно не будет переносимым.
 X11_ENV = {
     "GDK_BACKEND": "x11",
     "QT_QPA_PLATFORM": "xcb",
@@ -49,7 +86,7 @@ X11_ENV = {
     "ELECTRON_OZONE_PLATFORM_HINT": "x11",
 }
 
-ATTACH_OPTS = ["--tray=no", "--splash=no", "--reconnect=no"]
+NOTIFY = True
 
 
 # ───────────────────────── утилиты ─────────────────────────
@@ -62,9 +99,13 @@ def log(msg: str) -> None:
     print(f"[windrift {time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
+def step(msg: str) -> None:
+    print(f"\n\033[1;35m▶ {msg}\033[0m", flush=True)
+
+
 def notify(msg: str) -> None:
     log(msg)
-    if shutil.which("notify-send"):
+    if NOTIFY and shutil.which("notify-send"):
         subprocess.run(["notify-send", "-a", "windrift", "windrift", msg], check=False)
 
 
@@ -83,23 +124,146 @@ def spawn_detached(cmd: list[str], env: dict | None = None) -> int:
     return p.pid
 
 
-def load_config(path: Path = CONFIG_PATH) -> dict:
-    if not path.exists():
-        raise WindriftError(f"нет конфига {path} (см. config.example.toml)")
-    with open(path, "rb") as f:
-        cfg = tomllib.load(f)
-    for key in ("name", "token", "peer"):
-        if key not in cfg:
-            raise WindriftError(f"в конфиге нет обязательного поля '{key}'")
-    for key in ("name", "host", "ssh"):
-        if key not in cfg["peer"]:
-            raise WindriftError(f"в [peer] нет обязательного поля '{key}'")
-    cfg.setdefault("port", DEFAULT_PORT)
-    cfg.setdefault("listen", "0.0.0.0")
-    cfg.setdefault("backend", "hyprland")
-    cfg.setdefault("clipboard", True)
-    cfg["peer"].setdefault("port", DEFAULT_PORT)
+# ───────────────────────── конфиг ─────────────────────────
+
+def merge(base: dict, over: dict) -> dict:
+    out = copy.deepcopy(base)
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(path: Path = CONFIG_PATH, strict: bool = True) -> dict:
+    over = {}
+    if path.exists():
+        with open(path, "rb") as f:
+            over = tomllib.load(f)
+    elif strict:
+        raise WindriftError(f"нет конфига {path} — создай его: `windrift init` или `windrift settings`")
+    cfg = merge(DEFAULTS, over)
+    if strict:
+        missing = [k for k in ("name", "token") if not cfg[k]]
+        missing += [f"peer.{k}" for k in ("name", "host", "ssh") if not cfg["peer"][k]]
+        if missing:
+            raise WindriftError(f"в конфиге не заполнено: {', '.join(missing)}")
+    global NOTIFY
+    NOTIFY = bool(cfg["notify"])
     return cfg
+
+
+def tv(v) -> str:
+    """Значение Python → TOML."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, list):
+        return "[" + ", ".join(tv(x) for x in v) + "]"
+    raise TypeError(f"не умею записать {type(v)} в TOML")
+
+
+def render_config(c: dict) -> str:
+    p, x, s = c["peer"], c["xpra"], c["setup"]
+    return f"""# windrift — конфигурация
+# Править можно вручную или через `windrift settings`.
+# На второй машине конфиг зеркальный: свой name, а в [peer] — эта машина.
+# `windrift setup-peer` создаёт его там автоматически.
+
+# ── Эта машина ───────────────────────────────────────────────
+name = {tv(c["name"])}
+# имя этой машины (любое, без пробелов)
+
+token = {tv(c["token"])}
+# общий секрет, ОДИНАКОВЫЙ на обеих машинах (openssl rand -hex 32)
+
+port = {tv(c["port"])}
+# порт демона
+
+listen = {tv(c["listen"])}
+# на каком адресе слушает демон: "0.0.0.0" — все интерфейсы,
+# лучше указать IP в локальной сети или WireGuard-интерфейса
+
+backend = {tv(c["backend"])}
+# как узнать активное окно: "hyprland" | "kde" (нужен kdotool) | "sway"
+
+notify = {tv(c["notify"])}
+# показывать ошибки через notify-send
+
+# ── Буфер обмена ─────────────────────────────────────────────
+clipboard = {tv(c["clipboard"])}
+# синхронизировать текстовый буфер обмена с соседом
+
+clipboard_interval = {tv(float(c["clipboard_interval"]))}
+# как часто проверять буфер, секунд
+
+clipboard_max_kb = {tv(c["clipboard_max_kb"])}
+# не пересылать текст больше этого размера, КБ
+
+# ── Сосед ────────────────────────────────────────────────────
+[peer]
+name = {tv(p["name"])}
+# имя соседа — должно совпадать с его name
+
+host = {tv(p["host"])}
+# IP или имя соседа в сети (для связи демонов)
+
+port = {tv(p["port"])}
+# порт демона соседа
+
+ssh = {tv(p["ssh"])}
+# как зайти к соседу по ssh: "user@192.168.1.20" или алиас из ~/.ssh/config
+# вход должен быть по ключу, без пароля
+
+# ── xpra ─────────────────────────────────────────────────────
+[xpra]
+display_base = {tv(x["display_base"])}
+# с какого номера X-дисплея нумеровать сессии (:100, :101, ...)
+
+encoding = {tv(x["encoding"])}
+# кодирование картинки: "auto" | "rgb" | "png" | "jpeg" | "webp" | "h264" | "vp8" | "vp9"
+
+quality = {tv(x["quality"])}
+# качество для сжатия с потерями, 1–100; 0 — пусть xpra решает сам
+
+speaker = {tv(x["speaker"])}
+# пересылать звук программы (нужен gst-python)
+
+microphone = {tv(x["microphone"])}
+# пересылать микрофон в программу
+
+server_args = {tv(x["server_args"])}
+# доп. аргументы для `xpra start`, например ["--dpi=120"]
+
+attach_args = {tv(x["attach_args"])}
+# доп. аргументы для `xpra attach`, например ["--desktop-scaling=off"]
+
+# ── Установка на соседа (windrift setup-peer) ────────────────
+[setup]
+repo = {tv(s["repo"])}
+dir = {tv(s["dir"])}
+packages = {tv(s["packages"])}
+"""
+
+
+def save_config(cfg: dict, path: Path = CONFIG_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_config(cfg))
+    path.chmod(0o600)   # внутри токен
+
+
+def cmd_init(path: Path, force: bool) -> None:
+    if path.exists() and not force:
+        raise WindriftError(f"{path} уже есть (перезаписать: windrift init --force)")
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["name"] = socket.gethostname().split(".")[0]
+    cfg["token"] = secrets.token_hex(32)
+    save_config(cfg, path)
+    print(f"создан {path}\nзаполни секцию [peer] (или открой `windrift settings`)")
 
 
 # ───────────────────────── реестр сессий ─────────────────────────
@@ -118,14 +282,20 @@ def registry_save(reg: dict) -> None:
     registry_path().write_text(json.dumps(reg, indent=2, ensure_ascii=False))
 
 
-def free_display(reg: dict) -> int:
-    n = DISPLAY_BASE
+def free_display(cfg: dict, reg: dict) -> int:
+    n = int(cfg["xpra"]["display_base"])
     while str(n) in reg or Path(f"/tmp/.X11-unix/X{n}").exists():
         n += 1
     return n
 
 
 # ───────────────────────── xpra ─────────────────────────
+
+def media_opts(cfg: dict) -> list[str]:
+    x = cfg["xpra"]
+    return [f"--speaker={'yes' if x['speaker'] else 'no'}",
+            f"--microphone={'yes' if x['microphone'] else 'no'}"]
+
 
 def attach_cmd(cfg: dict, owner: str, display: int) -> list[str]:
     """Клиент всегда подключается к ВЛАДЕЛЬЦУ — поэтому цепочек не бывает."""
@@ -135,14 +305,20 @@ def attach_cmd(cfg: dict, owner: str, display: int) -> list[str]:
         spec = f"ssh://{cfg['peer']['ssh']}/{display}"         # напрямую к владельцу
     else:
         raise WindriftError(f"неизвестный владелец '{owner}'")
-    return ["xpra", "attach", spec, *ATTACH_OPTS]
+    x = cfg["xpra"]
+    opts = ["--tray=no", "--splash=no", "--reconnect=no", *media_opts(cfg)]
+    if x["encoding"] != "auto":
+        opts.append(f"--encoding={x['encoding']}")
+    if int(x["quality"]) > 0:
+        opts.append(f"--quality={int(x['quality'])}")
+    return ["xpra", "attach", spec, *opts, *x["attach_args"]]
 
 
 def cmd_run(cfg: dict, argv: list[str]) -> None:
     if not argv:
         raise WindriftError("укажи программу: windrift run firefox")
     reg = registry_load()
-    n = free_display(reg)
+    n = free_display(cfg, reg)
     env = os.environ.copy()
     env.pop("WAYLAND_DISPLAY", None)
     env.update(X11_ENV)
@@ -154,7 +330,9 @@ def cmd_run(cfg: dict, argv: list[str]) -> None:
         "--attach=no",
         "--daemon=yes",
         "--tray=no",
+        *media_opts(cfg),
         *[f"--env={k}={v}" for k, v in X11_ENV.items()],
+        *cfg["xpra"]["server_args"],
     ]
     log(f"старт сессии :{n} → {shlex.join(argv)}")
     subprocess.run(server, env=env, check=True)
@@ -199,7 +377,7 @@ def focused_pid(backend: str) -> int:
                 return int(node["pid"])
             stack += node.get("nodes", []) + node.get("floating_nodes", [])
         raise WindriftError("sway: активное окно не найдено")
-    raise WindriftError(f"неизвестный backend '{backend}' (hyprland | kde | sway)")
+    raise WindriftError(f"неизвестный backend '{backend}' ({' | '.join(BACKENDS)})")
 
 
 def parse_attach_args(cfg: dict, args: list[str]) -> tuple[str, int] | None:
@@ -266,10 +444,12 @@ def cmd_send(cfg: dict) -> None:
 # ───────────────────────── буфер обмена ─────────────────────────
 
 class Clipboard:
-    """Простая синхронизация текста через wl-paste/wl-copy (опрос раз в 0.5 с)."""
+    """Синхронизация текста через wl-paste/wl-copy (опрос)."""
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        self.interval = float(cfg["clipboard_interval"])
+        self.max_bytes = int(cfg["clipboard_max_kb"]) * 1024
         self.last = self._hash(self._read())
 
     @staticmethod
@@ -296,12 +476,13 @@ class Clipboard:
             h = self._hash(data)
             if data is not None and h != self.last:
                 self.last = h
-                try:
-                    await asyncio.to_thread(send_peer, self.cfg,
-                                            {"cmd": "clip", "data": data.decode(errors="replace")})
-                except (OSError, WindriftError) as e:
-                    log(f"буфер не отправлен: {e}")
-            await asyncio.sleep(0.5)
+                if len(data) <= self.max_bytes:
+                    try:
+                        await asyncio.to_thread(send_peer, self.cfg,
+                                                {"cmd": "clip", "data": data.decode(errors="replace")})
+                    except (OSError, WindriftError) as e:
+                        log(f"буфер не отправлен: {e}")
+            await asyncio.sleep(self.interval)
 
 
 # ───────────────────────── демон ─────────────────────────
@@ -373,12 +554,364 @@ def cmd_doctor(cfg: dict) -> None:
     sys.exit(0 if ok else 1)
 
 
+# ───────────────────────── установка на соседа ─────────────────────────
+
+def ssh_ok(target: str) -> bool:
+    return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target, "true"],
+                          capture_output=True).returncode == 0
+
+
+def ssh_hostname(target: str) -> str:
+    """Реальный адрес за ssh-алиасом (ssh -G pc1)."""
+    out = run_out(["ssh", "-G", target])
+    for line in out.splitlines():
+        if line.startswith("hostname "):
+            return line.split(None, 1)[1]
+    return target.split("@")[-1]
+
+
+def local_ip_towards(host: str) -> str:
+    """Наш IP, с которого виден сосед."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((host, 9))
+        return s.getsockname()[0]
+
+
+def remote_bash(target: str, script: str, tty: bool = False, input_text: str | None = None,
+                capture: bool = False) -> subprocess.CompletedProcess:
+    # оборачиваем в bash -c: у соседа login shell может быть fish
+    cmd = ["ssh", *(["-t"] if tty else []), target, "bash -c " + shlex.quote(script)]
+    return subprocess.run(cmd, input=input_text, text=True, check=True,
+                          capture_output=capture)
+
+
+def cmd_setup_peer(cfg: dict, target: str | None, peer_backend: str | None) -> None:
+    target = target or cfg["peer"]["ssh"]
+    if not target:
+        raise WindriftError("не задан ssh соседа: windrift setup-peer user@host")
+    if not cfg["peer"]["name"]:
+        raise WindriftError("заполни peer.name в конфиге (имя соседа)")
+    if not cfg["token"]:
+        cfg["token"] = secrets.token_hex(32)
+    cfg["peer"]["ssh"] = target
+    if not cfg["peer"]["host"]:
+        cfg["peer"]["host"] = ssh_hostname(target)
+    save_config(cfg)
+
+    step(f"1/5 ssh-ключ: эта машина → {target}")
+    if ssh_ok(target):
+        print("уже настроен")
+    else:
+        key = Path.home() / ".ssh" / "id_ed25519"
+        if not key.exists():
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+        subprocess.run(["ssh-copy-id", target], check=True)
+
+    step("2/5 пакеты и windrift на соседе (может спросить пароль sudo)")
+    s = cfg["setup"]
+    d = s["dir"].replace("~", "$HOME", 1)
+    remote_bash(target, f"""set -e
+sudo pacman -S --needed {" ".join(shlex.quote(p) for p in s["packages"])}
+sudo systemctl enable --now sshd
+if [ -d "{d}/.git" ]; then git -C "{d}" pull --ff-only; else git clone {shlex.quote(s["repo"])} "{d}"; fi
+install -Dm755 "{d}/windrift" "$HOME/.local/bin/windrift"
+install -Dm644 "{d}/windrift-settings.desktop" "$HOME/.local/share/applications/windrift-settings.desktop" || true
+""", tty=True)
+
+    step(f"3/5 ssh-ключ: {target} → эта машина")
+    pub = remote_bash(target, """set -e
+[ -f ~/.ssh/id_ed25519.pub ] || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
+cat ~/.ssh/id_ed25519.pub
+""", capture=True).stdout.strip()
+    ssh_dir = Path.home() / ".ssh"
+    ssh_dir.mkdir(mode=0o700, exist_ok=True)
+    auth = ssh_dir / "authorized_keys"
+    existing = auth.read_text() if auth.exists() else ""
+    if pub and pub not in existing:
+        with open(auth, "a") as f:
+            f.write(("" if existing.endswith("\n") or not existing else "\n") + pub + "\n")
+        auth.chmod(0o600)
+        print("ключ соседа добавлен в ~/.ssh/authorized_keys")
+    else:
+        print("ключ соседа уже есть")
+    if subprocess.run(["systemctl", "is-active", "--quiet", "sshd"]).returncode != 0:
+        print("здесь не запущен sshd — включаю (может спросить пароль sudo)")
+        subprocess.run(["sudo", "systemctl", "enable", "--now", "sshd"], check=False)
+
+    step("4/5 зеркальный конфиг на соседе")
+    my_ip = local_ip_towards(cfg["peer"]["host"])
+    pcfg = copy.deepcopy(cfg)
+    pcfg["name"] = cfg["peer"]["name"]
+    pcfg["backend"] = peer_backend or cfg["backend"]
+    pcfg["peer"] = {"name": cfg["name"], "host": my_ip, "port": cfg["port"],
+                    "ssh": f"{getpass.getuser()}@{my_ip}"}
+    remote_bash(target, """set -e
+mkdir -p ~/.config/windrift
+f=~/.config/windrift/config.toml
+[ -f "$f" ] && cp "$f" "$f.bak" && echo "старый конфиг сохранён в $f.bak"
+cat > "$f"
+chmod 600 "$f"
+""", input_text=render_config(pcfg))
+    print(f"name={pcfg['name']}, backend={pcfg['backend']}, peer={my_ip}")
+
+    step("5/5 проверка")
+    ok = ssh_ok(target)
+    print(f"{'✓' if ok else '✗'} ssh {target}")
+    r = remote_bash(target, f"ssh -o BatchMode=yes -o ConnectTimeout=5 {getpass.getuser()}@{my_ip} true "
+                            "&& echo ok || echo fail", capture=True)
+    back = r.stdout.strip().endswith("ok")
+    print(f"{'✓' if back else '✗'} ssh обратно с соседа на {my_ip}")
+    print("\nГотово. Осталось запустить демон на обеих машинах:\n"
+          "  Hyprland: exec-once = windrift daemon   (в hyprland.conf)\n"
+          "  KDE: Автозапуск → windrift daemon\n"
+          "и проверить: windrift doctor")
+
+
+# ───────────────────────── окно настроек ─────────────────────────
+
+TERMINALS = [  # (бинарь, как передать команду)
+    ("kitty", ["--"]), ("foot", []), ("alacritty", ["-e"]), ("wezterm", ["start", "--"]),
+    ("konsole", ["-e"]), ("gnome-terminal", ["--"]), ("xterm", ["-e"]),
+]
+
+
+def open_in_terminal(cmd: list[str]) -> bool:
+    hold = ["bash", "-c", shlex.join(cmd) + '; echo; read -rp "Enter — закрыть "']
+    env_term = os.environ.get("TERMINAL")
+    candidates = ([(env_term, ["-e"])] if env_term else []) + TERMINALS
+    for term, prefix in candidates:
+        if shutil.which(term):
+            subprocess.Popen([term, *prefix, *hold], start_new_session=True)
+            return True
+    return False
+
+
+def cmd_settings(path: Path) -> None:
+    try:
+        import gi
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import GLib, Gtk
+    except (ImportError, ValueError):
+        raise WindriftError("для окна настроек нужны пакеты python-gobject и gtk4: "
+                            "sudo pacman -S python-gobject gtk4")
+
+    cfg = load_config(path, strict=False)
+    if not cfg["name"]:
+        cfg["name"] = socket.gethostname().split(".")[0]
+    script = os.path.realpath(__file__)
+
+    def get(keypath):
+        node = cfg
+        for k in keypath.split("."):
+            node = node[k]
+        return node
+
+    def put(target, keypath, value):
+        *head, last = keypath.split(".")
+        for k in head:
+            target = target[k]
+        target[last] = value
+
+    def on_activate(app):
+        win = Gtk.ApplicationWindow(application=app, title="windrift — настройки")
+        win.set_default_size(620, 760)
+        readers: dict = {}
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(outer, f"set_margin_{side}")(16)
+        win.set_child(outer)
+
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        scroll.set_child(form)
+        outer.append(scroll)
+
+        grid = None
+        row = 0
+        labels = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)   # одна колонка подписей
+
+        def section(title):
+            nonlocal grid, row
+            lbl = Gtk.Label(xalign=0)
+            lbl.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
+            lbl.set_margin_top(12)
+            form.append(lbl)
+            grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+            form.append(grid)
+            row = 0
+
+        def add(label, widget, hint=""):
+            nonlocal row
+            lbl = Gtk.Label(label=label, xalign=0)
+            labels.add_widget(lbl)
+            widget.set_hexpand(True)
+            if hint:
+                lbl.set_tooltip_text(hint)
+                widget.set_tooltip_text(hint)
+            grid.attach(lbl, 0, row, 1, 1)
+            grid.attach(widget, 1, row, 1, 1)
+            row += 1
+
+        def entry(key, label, hint=""):
+            e = Gtk.Entry(text=str(get(key)))
+            add(label, e, hint)
+            readers[key] = lambda: e.get_text().strip()
+            return e
+
+        def list_entry(key, label, hint=""):
+            e = Gtk.Entry(text=shlex.join(get(key)))
+            add(label, e, hint + " (через пробел, как в shell)")
+            readers[key] = lambda: shlex.split(e.get_text())
+
+        def spin(key, label, lo, hi, step_, digits=0, hint=""):
+            sp = Gtk.SpinButton.new_with_range(lo, hi, step_)
+            sp.set_digits(digits)
+            sp.set_value(float(get(key)))
+            add(label, sp, hint)
+            readers[key] = (lambda: round(sp.get_value(), digits)) if digits else (lambda: int(sp.get_value()))
+
+        def switch(key, label, hint=""):
+            sw = Gtk.Switch(active=bool(get(key)), halign=Gtk.Align.START)
+            add(label, sw, hint)
+            readers[key] = sw.get_active
+
+        def dropdown(key, label, options, hint=""):
+            dd = Gtk.DropDown.new_from_strings(options)
+            cur = str(get(key))
+            dd.set_selected(options.index(cur) if cur in options else 0)
+            add(label, dd, hint)
+            readers[key] = lambda: options[dd.get_selected()]
+
+        section("Эта машина")
+        entry("name", "Имя", "имя этой машины, без пробелов")
+        tok = Gtk.Box(spacing=6)
+        tok_entry = Gtk.Entry(text=cfg["token"], hexpand=True, visibility=False)
+        tok_show = Gtk.ToggleButton(label="👁")
+        tok_show.connect("toggled", lambda b: tok_entry.set_visibility(b.get_active()))
+        tok_gen = Gtk.Button(label="Сгенерировать")
+        tok_gen.connect("clicked", lambda _b: tok_entry.set_text(secrets.token_hex(32)))
+        for w in (tok_entry, tok_show, tok_gen):
+            tok.append(w)
+        add("Токен", tok, "общий секрет, одинаковый на обеих машинах")
+        readers["token"] = lambda: tok_entry.get_text().strip()
+        dropdown("backend", "Композитор", BACKENDS, "как узнать активное окно")
+        spin("port", "Порт демона", 1, 65535, 1)
+        entry("listen", "Слушать адрес", "0.0.0.0 — все интерфейсы")
+        switch("notify", "Уведомления об ошибках")
+
+        section("Сосед")
+        entry("peer.name", "Имя соседа", "должно совпадать с его name")
+        entry("peer.host", "Адрес (IP)", "IP или имя соседа в сети")
+        spin("peer.port", "Порт демона соседа", 1, 65535, 1)
+        entry("peer.ssh", "SSH", "user@192.168.1.20 или алиас из ~/.ssh/config")
+
+        section("Буфер обмена")
+        switch("clipboard", "Синхронизировать")
+        spin("clipboard_interval", "Интервал опроса, с", 0.1, 10, 0.1, digits=1)
+        spin("clipboard_max_kb", "Максимум, КБ", 1, 102400, 64)
+
+        section("xpra")
+        dropdown("xpra.encoding", "Кодирование", ENCODINGS)
+        spin("xpra.quality", "Качество (0 = авто)", 0, 100, 5)
+        switch("xpra.speaker", "Пересылать звук", "нужен gst-python")
+        switch("xpra.microphone", "Пересылать микрофон")
+        spin("xpra.display_base", "Первый дисплей", 10, 9000, 1)
+        list_entry("xpra.server_args", "Аргументы сервера")
+        list_entry("xpra.attach_args", "Аргументы клиента")
+
+        section("Установка на соседа")
+        entry("setup.repo", "Репозиторий")
+        entry("setup.dir", "Папка у соседа")
+        list_entry("setup.packages", "Пакеты")
+
+        status = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        outer.append(status)
+        out_view = Gtk.TextView(editable=False, monospace=True)
+        out_scroll = Gtk.ScrolledWindow(min_content_height=120, visible=False)
+        out_scroll.set_child(out_view)
+        outer.append(out_scroll)
+
+        def say(text, error=False):
+            color = "#e06c75" if error else "#98c379"
+            status.set_markup(f"<span foreground='{color}'>{GLib.markup_escape_text(text)}</span>")
+
+        def collect():
+            new = copy.deepcopy(cfg)
+            for k, read in readers.items():
+                put(new, k, read())
+            return new
+
+        def save(_b=None):
+            try:
+                new = collect()
+                if not new["name"] or " " in new["name"]:
+                    raise WindriftError("имя машины пустое или с пробелами")
+                if not new["token"]:
+                    new["token"] = secrets.token_hex(32)
+                    tok_entry.set_text(new["token"])
+                save_config(new, path)
+                cfg.clear()
+                cfg.update(new)
+                say(f"Сохранено: {path}")
+                return True
+            except (WindriftError, ValueError, OSError) as e:
+                say(f"Ошибка: {e}", error=True)
+                return False
+
+        def doctor(_b):
+            if not save():
+                return
+            say("Проверяю…")
+
+            def work():
+                r = subprocess.run([sys.executable, script, "--config", str(path), "doctor"],
+                                   capture_output=True, text=True)
+                GLib.idle_add(lambda: (out_scroll.set_visible(True),
+                                       out_view.get_buffer().set_text(r.stdout + r.stderr),
+                                       say("Всё в порядке" if r.returncode == 0 else "Есть проблемы — см. ниже",
+                                           error=r.returncode != 0)) and False)
+            threading.Thread(target=work, daemon=True).start()
+
+        def setup_peer(_b):
+            if not save():
+                return
+            if not cfg["peer"]["ssh"] or not cfg["peer"]["name"]:
+                say("Заполни имя соседа и SSH", error=True)
+                return
+            cmd = [sys.executable, script, "--config", str(path), "setup-peer"]
+            if open_in_terminal(cmd):
+                say("Установка идёт в окне терминала")
+            else:
+                say("Терминал не найден. Запусти вручную: windrift setup-peer", error=True)
+
+        buttons = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        for label, cb in (("Проверить связь", doctor), ("Установить на соседа", setup_peer),
+                          ("Сохранить", save)):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", cb)
+            buttons.append(b)
+        buttons.get_last_child().add_css_class("suggested-action")
+        outer.append(buttons)
+        win.present()
+
+    app = Gtk.Application(application_id="io.github.windrift.Settings")
+    app.connect("activate", on_activate)
+    app.run([])
+
+
 # ───────────────────────── main ─────────────────────────
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="windrift", description="перенос живых окон между двумя машинами")
     ap.add_argument("--config", type=Path, default=CONFIG_PATH)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    p_init = sub.add_parser("init", help="создать конфиг со всеми настройками")
+    p_init.add_argument("--force", action="store_true")
+    sub.add_parser("settings", help="окно настроек")
+    p_setup = sub.add_parser("setup-peer", help="установить и настроить windrift на соседе по SSH")
+    p_setup.add_argument("ssh", nargs="?", help="user@host или ssh-алиас (по умолчанию peer.ssh)")
+    p_setup.add_argument("--backend", choices=BACKENDS, help="композитор соседа (по умолчанию как здесь)")
     p_run = sub.add_parser("run", help="запустить программу в переносимой сессии")
     p_run.add_argument("argv", nargs=argparse.REMAINDER)
     sub.add_parser("send", help="отправить активное окно соседу")
@@ -390,14 +923,16 @@ def main() -> None:
     a = ap.parse_args()
 
     try:
-        cfg = load_config(a.config)
         match a.cmd:
-            case "run": cmd_run(cfg, a.argv)
-            case "send": cmd_send(cfg)
-            case "daemon": asyncio.run(daemon(cfg))
-            case "list": cmd_list(cfg)
-            case "stop": cmd_stop(cfg, a.display)
-            case "doctor": cmd_doctor(cfg)
+            case "init": cmd_init(a.config, a.force)
+            case "settings": cmd_settings(a.config)
+            case "setup-peer": cmd_setup_peer(load_config(a.config, strict=False), a.ssh, a.backend)
+            case "run": cmd_run(load_config(a.config), a.argv)
+            case "send": cmd_send(load_config(a.config))
+            case "daemon": asyncio.run(daemon(load_config(a.config)))
+            case "list": cmd_list(load_config(a.config))
+            case "stop": cmd_stop(load_config(a.config), a.display)
+            case "doctor": cmd_doctor(load_config(a.config))
     except (WindriftError, OSError, subprocess.CalledProcessError) as e:
         notify(f"ошибка: {e}")
         sys.exit(1)
