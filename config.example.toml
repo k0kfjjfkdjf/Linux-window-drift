@@ -1,0 +1,15 @@
+# ~/.config/windrift/config.toml
+# На второй машине — зеркально: свой name, а в [peer] — эта машина.
+
+name = "pc"                 # имя ЭТОЙ машины
+token = "замени-на-длинную-случайную-строку"   # одинаковый на обеих: openssl rand -hex 32
+port = 7781
+listen = "0.0.0.0"          # лучше IP в локалке или WireGuard-интерфейса
+backend = "hyprland"        # hyprland | kde | sway
+clipboard = true            # синхронизация текстового буфера обмена
+
+[peer]
+name = "laptop"             # имя СОСЕДА (должно совпадать с его name)
+host = "192.168.1.20"       # адрес демона соседа
+port = 7781
+ssh = "user@192.168.1.20"   # ssh до соседа (по ключу, без пароля)
