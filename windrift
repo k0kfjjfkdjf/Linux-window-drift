@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""
+windrift — прототип переноса живых окон между двумя Linux-машинами.
+
+Идея: каждая программа запускается внутри собственного xpra-сервера на
+"машине-владельце" и по умолчанию показывается локально. Команда `send`
+подключает клиента на соседней машине НАПРЯМУЮ к владельцу (xpra с
+sharing=no сам отключает старого клиента). Цепочек не бывает: подключение
+всегда идёт к владельцу, а если владелец — сама целевая машина, то через
+локальный unix-сокет без сети.
+
+Команды:
+  windrift run <cmd...>   запустить программу в переносимой сессии
+  windrift send           отправить активное окно на соседнюю машину
+  windrift daemon         демон: принимает окна и синхронизирует буфер обмена
+  windrift list           показать локальные сессии
+  windrift stop <N>       остановить сессию :N
+  windrift doctor         проверить зависимости и связь с соседом
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "windrift" / "config.toml"
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/windrift-{os.getuid()}")) / "windrift"
+DISPLAY_BASE = 100
+DEFAULT_PORT = 7781
+
+# Внутри xpra-сессии программы должны работать через X11, а не лезть
+# напрямую в Wayland-композитор — иначе окно не будет переносимым.
+X11_ENV = {
+    "GDK_BACKEND": "x11",
+    "QT_QPA_PLATFORM": "xcb",
+    "MOZ_ENABLE_WAYLAND": "0",
+    "SDL_VIDEODRIVER": "x11",
+    "ELECTRON_OZONE_PLATFORM_HINT": "x11",
+}
+
+ATTACH_OPTS = ["--tray=no", "--splash=no", "--reconnect=no"]
+
+
+# ───────────────────────── утилиты ─────────────────────────
+
+class WinhopError(Exception):
+    pass
+
+
+def log(msg: str) -> None:
+    print(f"[windrift {time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
+def notify(msg: str) -> None:
+    log(msg)
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "windrift", "windrift", msg], check=False)
+
+
+def run_out(cmd: list[str], timeout: float = 5) -> str:
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise WinhopError(f"{shlex.join(cmd)} → {r.stderr.strip() or r.returncode}")
+    return r.stdout
+
+
+def spawn_detached(cmd: list[str], env: dict | None = None) -> int:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    logf = open(RUNTIME / "xpra.log", "ab")
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                         start_new_session=True, env=env)
+    return p.pid
+
+
+def load_config(path: Path = CONFIG_PATH) -> dict:
+    if not path.exists():
+        raise WinhopError(f"нет конфига {path} (см. config.example.toml)")
+    with open(path, "rb") as f:
+        cfg = tomllib.load(f)
+    for key in ("name", "token", "peer"):
+        if key not in cfg:
+            raise WinhopError(f"в конфиге нет обязательного поля '{key}'")
+    for key in ("name", "host", "ssh"):
+        if key not in cfg["peer"]:
+            raise WinhopError(f"в [peer] нет обязательного поля '{key}'")
+    cfg.setdefault("port", DEFAULT_PORT)
+    cfg.setdefault("listen", "0.0.0.0")
+    cfg.setdefault("backend", "hyprland")
+    cfg.setdefault("clipboard", True)
+    cfg["peer"].setdefault("port", DEFAULT_PORT)
+    return cfg
+
+
+# ───────────────────────── реестр сессий ─────────────────────────
+
+def registry_path() -> Path:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    return RUNTIME / "sessions.json"
+
+
+def registry_load() -> dict:
+    p = registry_path()
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+def registry_save(reg: dict) -> None:
+    registry_path().write_text(json.dumps(reg, indent=2, ensure_ascii=False))
+
+
+def free_display(reg: dict) -> int:
+    n = DISPLAY_BASE
+    while str(n) in reg or Path(f"/tmp/.X11-unix/X{n}").exists():
+        n += 1
+    return n
+
+
+# ───────────────────────── xpra ─────────────────────────
+
+def attach_cmd(cfg: dict, owner: str, display: int) -> list[str]:
+    """Клиент всегда подключается к ВЛАДЕЛЬЦУ — поэтому цепочек не бывает."""
+    if owner == cfg["name"]:
+        spec = f":{display}"                                   # локально, без сети
+    elif owner == cfg["peer"]["name"]:
+        spec = f"ssh://{cfg['peer']['ssh']}/{display}"         # напрямую к владельцу
+    else:
+        raise WinhopError(f"неизвестный владелец '{owner}'")
+    return ["xpra", "attach", spec, *ATTACH_OPTS]
+
+
+def cmd_run(cfg: dict, argv: list[str]) -> None:
+    if not argv:
+        raise WinhopError("укажи программу: windrift run firefox")
+    reg = registry_load()
+    n = free_display(reg)
+    env = os.environ.copy()
+    env.pop("WAYLAND_DISPLAY", None)
+    env.update(X11_ENV)
+    server = [
+        "xpra", "start", f":{n}",
+        f"--start-child={shlex.join(argv)}",
+        "--exit-with-children=yes",
+        "--sharing=no",          # новый клиент вытесняет старого = «перенос»
+        "--attach=no",
+        "--daemon=yes",
+        "--tray=no",
+        *[f"--env={k}={v}" for k, v in X11_ENV.items()],
+    ]
+    log(f"старт сессии :{n} → {shlex.join(argv)}")
+    subprocess.run(server, env=env, check=True)
+    reg[str(n)] = {"cmd": argv, "started": time.time()}
+    registry_save(reg)
+    spawn_detached(attach_cmd(cfg, cfg["name"], n))
+
+
+def cmd_list(cfg: dict) -> None:
+    reg = registry_load()
+    alive = {}
+    for n, info in reg.items():
+        if Path(f"/tmp/.X11-unix/X{n}").exists():
+            alive[n] = info
+            print(f":{n}\t{shlex.join(info['cmd'])}")
+    if alive != reg:
+        registry_save(alive)   # чистим мёртвые сессии
+    if not alive:
+        print("нет активных сессий")
+
+
+def cmd_stop(cfg: dict, display: int) -> None:
+    subprocess.run(["xpra", "stop", f":{display}"], check=False)
+    reg = registry_load()
+    reg.pop(str(display), None)
+    registry_save(reg)
+
+
+# ───────────────────────── бэкенды композиторов ─────────────────────────
+
+def focused_pid(backend: str) -> int:
+    if backend == "hyprland":
+        return int(json.loads(run_out(["hyprctl", "activewindow", "-j"]))["pid"])
+    if backend == "kde":
+        return int(run_out(["kdotool", "getactivewindow", "getwindowpid"]).strip())
+    if backend == "sway":
+        tree = json.loads(run_out(["swaymsg", "-t", "get_tree"]))
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            if node.get("focused") and node.get("pid"):
+                return int(node["pid"])
+            stack += node.get("nodes", []) + node.get("floating_nodes", [])
+        raise WinhopError("sway: активное окно не найдено")
+    raise WinhopError(f"неизвестный backend '{backend}' (hyprland | kde | sway)")
+
+
+def parse_attach_args(cfg: dict, args: list[str]) -> tuple[str, int] | None:
+    """Из командной строки xpra-клиента достаём (владелец, дисплей)."""
+    if "attach" not in args:
+        return None
+    i = args.index("attach")
+    if i + 1 >= len(args):
+        return None
+    spec = args[i + 1]
+    if spec.startswith(":"):
+        return cfg["name"], int(spec[1:])
+    if spec.startswith("ssh://"):
+        disp = spec.rsplit("/", 1)[1].lstrip(":")
+        return cfg["peer"]["name"], int(disp)
+    return None
+
+
+def proc_args(pid: int) -> list[str]:
+    raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    return [a.decode(errors="replace") for a in raw.split(b"\0") if a]
+
+
+def proc_ppid(pid: int) -> int:
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    return int(stat.rsplit(")", 1)[1].split()[1])
+
+
+def window_session(cfg: dict, pid: int) -> tuple[str, int]:
+    # окно принадлежит xpra-клиенту; на всякий случай поднимаемся по родителям
+    for _ in range(4):
+        if pid <= 1:
+            break
+        found = parse_attach_args(cfg, proc_args(pid))
+        if found:
+            return found
+        pid = proc_ppid(pid)
+    raise WinhopError("активное окно не из windrift — запускай программы через `windrift run`")
+
+
+# ───────────────────────── сеть между демонами ─────────────────────────
+
+def send_peer(cfg: dict, msg: dict, timeout: float = 5) -> dict:
+    peer = cfg["peer"]
+    payload = json.dumps({**msg, "token": cfg["token"]}, ensure_ascii=False) + "\n"
+    with socket.create_connection((peer["host"], peer["port"]), timeout=timeout) as s:
+        s.sendall(payload.encode())
+        reply = s.makefile().readline()
+    if not reply:
+        raise WinhopError("сосед закрыл соединение")
+    return json.loads(reply)
+
+
+def cmd_send(cfg: dict) -> None:
+    pid = focused_pid(cfg["backend"])
+    owner, display = window_session(cfg, pid)
+    log(f"окно pid={pid}: сессия :{display}, владелец {owner} → отправляю на {cfg['peer']['name']}")
+    reply = send_peer(cfg, {"cmd": "attach", "owner": owner, "display": display})
+    if not reply.get("ok"):
+        raise WinhopError(f"сосед отказал: {reply.get('error')}")
+    # Локальный клиент отключится сам: xpra-сервер с sharing=no вытеснит его.
+
+
+# ───────────────────────── буфер обмена ─────────────────────────
+
+class Clipboard:
+    """Простая синхронизация текста через wl-paste/wl-copy (опрос раз в 0.5 с)."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.last = self._hash(self._read())
+
+    @staticmethod
+    def _hash(data: bytes | None) -> str | None:
+        return hashlib.sha256(data).hexdigest() if data is not None else None
+
+    @staticmethod
+    def _read() -> bytes | None:
+        try:
+            r = subprocess.run(["wl-paste", "--no-newline", "--type", "text"],
+                               capture_output=True, timeout=2)
+        except subprocess.TimeoutExpired:
+            return None
+        return r.stdout if r.returncode == 0 else None
+
+    def set_from_peer(self, text: str) -> None:
+        data = text.encode()
+        self.last = self._hash(data)   # не отправлять обратно → нет пинг-понга
+        subprocess.run(["wl-copy"], input=data, timeout=2, check=False)
+
+    async def loop(self) -> None:
+        while True:
+            data = await asyncio.to_thread(self._read)
+            h = self._hash(data)
+            if data is not None and h != self.last:
+                self.last = h
+                try:
+                    await asyncio.to_thread(send_peer, self.cfg,
+                                            {"cmd": "clip", "data": data.decode(errors="replace")})
+                except (OSError, WinhopError) as e:
+                    log(f"буфер не отправлен: {e}")
+            await asyncio.sleep(0.5)
+
+
+# ───────────────────────── демон ─────────────────────────
+
+async def handle(reader, writer, cfg: dict, clip: Clipboard | None) -> None:
+    peer_addr = writer.get_extra_info("peername")
+    try:
+        line = await asyncio.wait_for(reader.readline(), timeout=5)
+        msg = json.loads(line)
+        if not hmac.compare_digest(str(msg.get("token", "")), cfg["token"]):
+            raise WinhopError("неверный token")
+        cmd = msg.get("cmd")
+        if cmd == "ping":
+            reply = {"ok": True, "name": cfg["name"]}
+        elif cmd == "attach":
+            argv = attach_cmd(cfg, msg["owner"], int(msg["display"]))
+            log(f"принимаю окно: {shlex.join(argv)}")
+            spawn_detached(argv)
+            reply = {"ok": True}
+        elif cmd == "clip":
+            if clip:
+                clip.set_from_peer(msg["data"])
+            reply = {"ok": True}
+        else:
+            raise WinhopError(f"неизвестная команда {cmd}")
+    except Exception as e:  # noqa: BLE001 — демон не должен падать
+        log(f"ошибка от {peer_addr}: {e}")
+        reply = {"ok": False, "error": str(e)}
+    writer.write((json.dumps(reply, ensure_ascii=False) + "\n").encode())
+    await writer.drain()
+    writer.close()
+
+
+async def daemon(cfg: dict) -> None:
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        log("внимание: WAYLAND_DISPLAY не задан — принятые окна некуда будет показать")
+    clip = Clipboard(cfg) if cfg["clipboard"] and shutil.which("wl-paste") else None
+    server = await asyncio.start_server(lambda r, w: handle(r, w, cfg, clip),
+                                        cfg["listen"], cfg["port"])
+    log(f"демон '{cfg['name']}' слушает {cfg['listen']}:{cfg['port']}, буфер обмена: {'да' if clip else 'нет'}")
+    tasks = [server.serve_forever()]
+    if clip:
+        tasks.append(clip.loop())
+    await asyncio.gather(*tasks)
+
+
+# ───────────────────────── doctor ─────────────────────────
+
+def cmd_doctor(cfg: dict) -> None:
+    need = {"xpra": True, "ssh": True, "wl-paste": cfg["clipboard"], "wl-copy": cfg["clipboard"],
+            {"hyprland": "hyprctl", "kde": "kdotool", "sway": "swaymsg"}.get(cfg["backend"], "?"): True}
+    ok = True
+    for tool, required in need.items():
+        if required:
+            found = shutil.which(tool)
+            ok &= bool(found)
+            print(f"{'✓' if found else '✗'} {tool}")
+    try:
+        r = send_peer(cfg, {"cmd": "ping"}, timeout=3)
+        print(f"✓ демон соседа отвечает: {r.get('name')}" if r.get("ok") else f"✗ сосед: {r.get('error')}")
+        ok &= bool(r.get("ok"))
+    except OSError as e:
+        print(f"✗ демон соседа недоступен: {e}")
+        ok = False
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+                        cfg["peer"]["ssh"], "command -v xpra"], capture_output=True, text=True)
+    print(f"{'✓' if r.returncode == 0 else '✗'} ssh {cfg['peer']['ssh']} без пароля и с xpra")
+    ok &= r.returncode == 0
+    sys.exit(0 if ok else 1)
+
+
+# ───────────────────────── main ─────────────────────────
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="windrift", description="перенос живых окон между двумя машинами")
+    ap.add_argument("--config", type=Path, default=CONFIG_PATH)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p_run = sub.add_parser("run", help="запустить программу в переносимой сессии")
+    p_run.add_argument("argv", nargs=argparse.REMAINDER)
+    sub.add_parser("send", help="отправить активное окно соседу")
+    sub.add_parser("daemon", help="запустить демон")
+    sub.add_parser("list", help="локальные сессии")
+    p_stop = sub.add_parser("stop", help="остановить сессию")
+    p_stop.add_argument("display", type=int)
+    sub.add_parser("doctor", help="проверить окружение")
+    a = ap.parse_args()
+
+    try:
+        cfg = load_config(a.config)
+        match a.cmd:
+            case "run": cmd_run(cfg, a.argv)
+            case "send": cmd_send(cfg)
+            case "daemon": asyncio.run(daemon(cfg))
+            case "list": cmd_list(cfg)
+            case "stop": cmd_stop(cfg, a.display)
+            case "doctor": cmd_doctor(cfg)
+    except (WinhopError, OSError, subprocess.CalledProcessError) as e:
+        notify(f"ошибка: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
