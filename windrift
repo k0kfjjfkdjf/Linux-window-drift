@@ -741,7 +741,8 @@ echo "xpra у соседа: $(xpra --version 2>/dev/null | head -1)"
 if [ -d "{d}/.git" ]; then git -C "{d}" fetch -q origin && git -C "{d}" reset -q --hard FETCH_HEAD
 else git clone -q {shlex.quote(s["repo"])} "{d}"; fi
 install -Dm755 "{d}/windrift" "$HOME/.local/bin/windrift"
-install -Dm644 "{d}/windrift-settings.desktop" "$HOME/.local/share/applications/windrift-settings.desktop" || true
+mkdir -p "$HOME/.local/share/applications"
+sed "s|^Exec=windrift|Exec=$HOME/.local/bin/windrift|" "{d}/windrift-settings.desktop" > "$HOME/.local/share/applications/windrift-settings.desktop" || true
 """, tty=True)
 
     step(f"3/6 ssh-ключ: {target} → эта машина")

@@ -21,7 +21,8 @@ sudo pacman -S git xpra wl-clipboard python openssh libnotify python-gobject gtk
 git clone https://github.com/k0kfjjfkdjf/Linux-window-drift.git ~/Linux-window-drift
 cd ~/Linux-window-drift
 install -Dm755 windrift ~/.local/bin/windrift
-install -Dm644 windrift-settings.desktop ~/.local/share/applications/windrift-settings.desktop
+mkdir -p ~/.local/share/applications
+sed "s|^Exec=windrift|Exec=$HOME/.local/bin/windrift|" windrift-settings.desktop > ~/.local/share/applications/windrift-settings.desktop
 
 windrift settings          # окно настроек: имя, сосед, токен → «Сохранить»
 ```
@@ -79,9 +80,9 @@ nano ~/.config/windrift/config.toml
 
 ## Запуск демона
 
-Hyprland (`hyprland.conf`):
+Hyprland (`~/.config/hypr/hyprland.conf`). Путь пишется полностью: Hyprland не видит `~/.local/bin`, даже если он есть в `PATH` у fish:
 ```
-exec-once = windrift daemon
+exec-once = ~/.local/bin/windrift daemon
 ```
 
 Или через systemd (переменные Wayland должны попасть в user-окружение):
@@ -96,9 +97,9 @@ KDE: «Параметры системы → Автозапуск → добав
 
 Hyprland:
 ```
-bind = SUPER SHIFT, Right, exec, windrift send
-bind = SUPER, B, exec, windrift run firefox
-bind = SUPER, T, exec, windrift run kitty
+bind = SUPER SHIFT, Right, exec, ~/.local/bin/windrift send
+bind = SUPER, B, exec, ~/.local/bin/windrift run firefox
+bind = SUPER, T, exec, ~/.local/bin/windrift run kitty
 ```
 
 KDE: «Комбинации клавиш → Добавить команду → `windrift send`».
