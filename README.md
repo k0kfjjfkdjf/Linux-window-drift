@@ -69,6 +69,7 @@ nano ~/.config/windrift/config.toml
 | — | `name`, `token`, `port`, `listen` | имя машины, общий секрет, порт и адрес демона |
 | — | `backend` | `auto` / `hyprland` / `kde` / `sway` / `x11`: как узнать активное окно (`auto` определяет сам) |
 | — | `notify` | уведомления об ошибках |
+| — | `keep_proportions`, `decorations` | пришедшее окно занимает ту же долю экрана, что и у соседа; рамка у пришедших окон в X11 |
 | — | `clipboard`, `clipboard_interval`, `clipboard_max_kb` | синхронизация буфера обмена |
 | `[peer]` | `name`, `host`, `port`, `ssh` | сосед: имя, адрес, порт демона, ssh-адрес или алиас |
 | `[xpra]` | `encoding`, `quality` | как сжимать картинку окна |

@@ -57,6 +57,8 @@ DEFAULTS: dict = {
     "listen": "0.0.0.0",
     "backend": "auto",
     "notify": True,
+    "keep_proportions": True,
+    "decorations": True,
     "clipboard": True,
     "clipboard_interval": 0.5,
     "clipboard_max_kb": 1024,
@@ -75,7 +77,7 @@ DEFAULTS: dict = {
         "dir": "~/Linux-window-drift",
         "packages": ["git", "xpra", "wl-clipboard", "python", "openssh", "libnotify",
                      "python-gobject", "gtk4"],
-        "packages_apt": ["git", "xpra", "xpra-x11", "python3", "xclip", "xdotool", "wl-clipboard",
+        "packages_apt": ["git", "xpra", "xpra-x11", "python3", "xclip", "xdotool", "x11-utils", "wl-clipboard",
                          "libnotify-bin", "openssh-server", "python3-gi", "gir1.2-gtk-4.0"],
         "xpra_channel": "stable",
     },
@@ -199,6 +201,14 @@ backend = {tv(c["backend"])}
 
 notify = {tv(c["notify"])}
 # показывать ошибки через notify-send
+
+# ── Окна, пришедшие с соседа ─────────────────────────────────
+keep_proportions = {tv(c["keep_proportions"])}
+# занимать ту же долю экрана и стоять в том же месте, что и у соседа
+# (в процентах, а не в пикселях); false — только ужать, если не влезает
+
+decorations = {tv(c["decorations"])}
+# X11: рисовать рамку с кнопками, даже если программа просила без неё
 
 # ── Буфер обмена ─────────────────────────────────────────────
 clipboard = {tv(c["clipboard"])}
@@ -383,8 +393,10 @@ def cmd_back(cfg: dict, display: int | None) -> None:
         spawn_detached(attach_cmd(cfg, cfg["name"], n))
 
 
-def fit_to_screen(pid: int, timeout: float = 15) -> None:
-    """X11: окно, пришедшее с большого экрана, ужать до 85% нашего экрана и поставить по центру."""
+def place_window(pid: int, geom: dict | None, keep_proportions: bool = True,
+                 decorations: bool = True, timeout: float = 15) -> None:
+    """X11: поставить пришедшее окно так же, как оно стояло у соседа (в долях экрана),
+    и при желании вернуть ему рамку. Без geom — только ужать, если не влезает."""
     if not shutil.which("xdotool"):
         return
     try:
@@ -393,24 +405,36 @@ def fit_to_screen(pid: int, timeout: float = 15) -> None:
         return
     deadline = time.time() + timeout
     while time.time() < deadline:
-        r = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(pid)],
-                           capture_output=True, text=True)
-        wids = r.stdout.split()
+        wids = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(pid)],
+                              capture_output=True, text=True).stdout.split()
         if wids:
-            time.sleep(0.5)   # дать xpra выставить исходный размер
-            for wid in wids:
-                g = subprocess.run(["xdotool", "getwindowgeometry", "--shell", wid],
-                                   capture_output=True, text=True).stdout
-                geo = dict(line.split("=", 1) for line in g.split() if "=" in line)
-                w, h = int(geo.get("WIDTH", 0)), int(geo.get("HEIGHT", 0))
-                if w > sw * 0.95 or h > sh * 0.9:
-                    nw, nh = min(w, int(sw * 0.85)), min(h, int(sh * 0.85))
-                    subprocess.run(["xdotool", "windowsize", wid, str(nw), str(nh),
-                                    "windowmove", wid, str((sw - nw) // 2), str((sh - nh) // 2)],
-                                   capture_output=True)
-                    log(f"окно {wid}: {w}x{h} → {nw}x{nh} под экран {sw}x{sh}")
-            return
+            break
         time.sleep(0.3)
+    else:
+        return
+    time.sleep(0.5)   # дать xpra выставить исходный размер
+    for wid in wids:
+        if decorations and shutil.which("xprop"):
+            # _MOTIF_WM_HINTS: flags=DECORATIONS, decorations=1 → оконный менеджер рисует рамку
+            subprocess.run(["xprop", "-id", wid, "-f", "_MOTIF_WM_HINTS", "32c",
+                            "-set", "_MOTIF_WM_HINTS", "2, 0, 1, 0, 0"], capture_output=True)
+        g = subprocess.run(["xdotool", "getwindowgeometry", "--shell", wid],
+                           capture_output=True, text=True).stdout
+        cur = dict(line.split("=", 1) for line in g.split() if "=" in line)
+        w, h = int(cur.get("WIDTH", 0)), int(cur.get("HEIGHT", 0))
+        if geom and keep_proportions:
+            nw = max(200, min(sw, round(geom["w"] * sw)))
+            nh = max(150, min(sh, round(geom["h"] * sh)))
+            nx = min(max(0, round(geom["x"] * sw)), sw - nw)
+            ny = min(max(0, round(geom["y"] * sh)), sh - nh)
+        elif w > sw * 0.95 or h > sh * 0.9:
+            nw, nh = min(w, int(sw * 0.85)), min(h, int(sh * 0.85))
+            nx, ny = (sw - nw) // 2, (sh - nh) // 2
+        else:
+            continue
+        subprocess.run(["xdotool", "windowsize", wid, str(nw), str(nh),
+                        "windowmove", wid, str(nx), str(ny)], capture_output=True)
+        log(f"окно {wid}: {w}x{h} → {nw}x{nh} в ({nx},{ny}) на экране {sw}x{sh}")
 
 
 def cmd_stop(cfg: dict, display: int) -> None:
@@ -518,11 +542,40 @@ def send_peer(cfg: dict, msg: dict, timeout: float = 5) -> dict:
     return json.loads(reply)
 
 
+def window_geometry(backend: str) -> dict | None:
+    """Место и размер активного окна в долях его монитора: {x, y, w, h} от 0 до 1."""
+    try:
+        backend = resolve_backend(backend)
+        if backend == "hyprland":
+            win = json.loads(run_out(["hyprctl", "activewindow", "-j"]))
+            mons = json.loads(run_out(["hyprctl", "monitors", "-j"]))
+            mon = next(m for m in mons if m["id"] == win["monitor"])
+            scale = float(mon.get("scale") or 1)
+            mw, mh = mon["width"] / scale, mon["height"] / scale
+            if int(mon.get("transform", 0)) % 2:
+                mw, mh = mh, mw
+            (x, y), (w, h) = win["at"], win["size"]
+            x, y = x - mon["x"], y - mon["y"]
+        elif backend == "x11":
+            g = run_out(["xdotool", "getactivewindow", "getwindowgeometry", "--shell"])
+            geo = dict(line.split("=", 1) for line in g.split() if "=" in line)
+            x, y, w, h = (int(geo[k]) for k in ("X", "Y", "WIDTH", "HEIGHT"))
+            mw, mh = map(int, run_out(["xdotool", "getdisplaygeometry"]).split())
+        else:
+            return None
+        clamp = lambda v: max(0.0, min(1.0, v))
+        return {"x": clamp(x / mw), "y": clamp(y / mh), "w": clamp(w / mw), "h": clamp(h / mh)}
+    except (WindriftError, OSError, ValueError, KeyError, StopIteration, subprocess.TimeoutExpired):
+        return None
+
+
 def cmd_send(cfg: dict) -> None:
     pid = focused_pid(cfg["backend"])
     owner, display = window_session(cfg, pid)
-    log(f"окно pid={pid}: сессия :{display}, владелец {owner} → отправляю на {cfg['peer']['name']}")
-    reply = send_peer(cfg, {"cmd": "attach", "owner": owner, "display": display})
+    geom = window_geometry(cfg["backend"])
+    log(f"окно pid={pid}: сессия :{display}, владелец {owner} → отправляю на {cfg['peer']['name']}"
+        + (f" (доля экрана {geom['w']:.0%}×{geom['h']:.0%})" if geom else ""))
+    reply = send_peer(cfg, {"cmd": "attach", "owner": owner, "display": display, "geom": geom})
     if not reply.get("ok"):
         raise WindriftError(f"сосед отказал: {reply.get('error')}")
     # Локальный клиент отключится сам: xpra-сервер с sharing=no вытеснит его.
@@ -600,7 +653,9 @@ async def handle(reader, writer, cfg: dict, clip: Clipboard | None) -> None:
             log(f"принимаю окно: {shlex.join(argv)}")
             pid = spawn_detached(argv)
             if session_kind() == "x11":
-                threading.Thread(target=fit_to_screen, args=(pid,), daemon=True).start()
+                threading.Thread(target=place_window, daemon=True,
+                                 args=(pid, msg.get("geom"), cfg["keep_proportions"],
+                                       cfg["decorations"])).start()
             reply = {"ok": True}
         elif cmd == "clip":
             if clip:
@@ -995,6 +1050,10 @@ def cmd_settings(path: Path) -> None:
         spin("port", "Порт демона", 1, 65535, 1)
         entry("listen", "Слушать адрес", "0.0.0.0 — все интерфейсы")
         switch("notify", "Уведомления об ошибках")
+        switch("keep_proportions", "Сохранять пропорции окна",
+               "пришедшее окно занимает ту же долю экрана, что и у соседа")
+        switch("decorations", "Рамка у пришедших окон (X11)",
+               "рисовать заголовок с кнопками, даже если программа просила без него")
 
         section("Сосед")
         entry("peer.name", "Имя соседа", "должно совпадать с его name")
