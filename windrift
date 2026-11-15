@@ -989,32 +989,38 @@ def cmd_mouse(cfg: dict, config_path: Path, action: str) -> None:
     d = config_path.parent / "deskflow"
     d.mkdir(parents=True, exist_ok=True)
     screens = d / "screens.conf"
+    use_core = bool(shutil.which("deskflow-core"))
+    # Deskflow 1.27+ (deskflow-core) берёт список компьютеров из [computer_<имя>] в настройках
+    # и игнорирует секцию screens; старый deskflow-server читает её из этого файла.
     screens.write_text(
-        "section: screens\n"
-        f"\t{me}:\n\t{peer}:\n"
-        "end\n\n"
+        ("" if use_core else f"section: screens\n\t{me}:\n\t{peer}:\nend\n\n") +
         "section: links\n"
         f"\t{me}:\n\t\t{side} = {peer}\n"
         f"\t{peer}:\n\t\t{OPPOSITE[side]} = {me}\n"
         "end\n")
     RUNTIME.mkdir(parents=True, exist_ok=True)
     log_path = RUNTIME / "deskflow-server.log"
-    if shutil.which("deskflow-core"):
+    if use_core:
         ini = d / "server.ini"
         ini.write_text(f"[core]\ncoreMode=2\ncomputerName={me}\nport={port}\n"
                        f"[server]\nexternalConfig=true\nexternalConfigFile={screens}\nenableClipboard=true\n"
-                       "[security]\ntlsEnabled=false\n")
+                       "[security]\ntlsEnabled=false\n"
+                       f"[computer_{me}]\nname={me}\n"
+                       f"[computer_{peer}]\nname={peer}\n")
         cmd = ["deskflow-core", "server", "--new-instance", "-s", str(ini)]
     elif shutil.which("deskflow-server"):
         cmd = ["deskflow-server", "-f", "-1", "-n", me, "-c", str(screens), "-a", f":{port}"]
     else:
         raise WindriftError("нет Deskflow: sudo pacman -S deskflow (или apt install deskflow)")
     with open(log_path, "w") as logf:
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True)
+        server = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                                  start_new_session=True)
     step(f"сервер Deskflow на {me} (сосед {peer} — {side}), порт {port}")
     print("Hyprland может спросить разрешение на захват ввода — разреши.")
     time.sleep(3)
     print(log_path.read_text()[-800:] or "(лог пуст)")
+    if server.poll() is not None:
+        raise WindriftError(f"сервер Deskflow завершился (код {server.returncode}), лог: {log_path}")
 
     step(f"клиент Deskflow на {peer}")
     subprocess.run(["ssh", cfg["peer"]["ssh"], f"env {remote_env} bash -s start"],
