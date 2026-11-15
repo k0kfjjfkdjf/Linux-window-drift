@@ -79,8 +79,12 @@ DEFAULTS: dict = {
         "repo": REPO_URL,
         "dir": "~/Linux-window-drift",
         "packages": ["git", "xpra", "wl-clipboard", "python", "openssh", "libnotify",
-                     "python-gobject", "gtk4"],
+                     "python-gobject", "gtk4", "gstreamer", "gst-plugins-base", "gst-plugins-good",
+                     "gst-plugins-ugly", "gst-libav", "gst-python"],
         "packages_apt": ["git", "xpra", "xpra-x11", "python3", "xclip", "xdotool", "x11-utils", "wl-clipboard",
+                         "gstreamer1.0-tools", "gstreamer1.0-plugins-base", "gstreamer1.0-plugins-good",
+                         "gstreamer1.0-plugins-ugly", "gstreamer1.0-libav", "gstreamer1.0-x",
+                         "python3-gst-1.0", "gir1.2-gst-plugins-base-1.0",
                          "libnotify-bin", "openssh-server", "python3-gi", "gir1.2-gtk-4.0"],
         "xpra_channel": "stable",
     },
@@ -385,30 +389,26 @@ def cmd_list(cfg: dict) -> None:
             print(f":{n}\t{shlex.join(info['cmd'])}")
     if alive != reg:
         registry_save(alive)   # чистим мёртвые сессии
-    m = mirror_load()
-    if m.get("xids"):
-        print(f":{m['display']}\tзеркало: " + ", ".join(m.get("titles", [])))
-    if not alive and not m.get("xids"):
+    streams = streams_load()
+    for xid, info in streams.items():
+        print(f"{int(xid):#x}\tзеркало у соседа: {info.get('title')}")
+    for vid, info in views_load().items():
+        print(f"{int(vid):#x}\tкопия окна с {info.get('owner')}")
+    if not alive and not streams:
         print("нет активных сессий")
 
 
 def alive_sessions() -> list[int]:
     reg = registry_load()
-    mirror = mirror_load()
-    skip = {int(mirror["display"])} if mirror.get("xids") else set()
-    return sorted(int(n) for n in reg if Path(f"/tmp/.X11-unix/X{n}").exists() and int(n) not in skip)
+    return sorted(int(n) for n in reg if Path(f"/tmp/.X11-unix/X{n}").exists())
 
 
 def cmd_back(cfg: dict, display: int | None) -> None:
     """Вернуть свои окна на эту машину (локальный клиент вытеснит клиента у соседа)."""
-    m = mirror_load()
-    if m.get("xids") and display in (None, int(m["display"])):
-        mirror_stop(int(m["display"]))
-        if display is not None:
-            return
+    if display is None:
+        for xid in list(streams_load()):
+            stream_stop(cfg, int(xid))
     targets = [display] if display is not None else alive_sessions()
-    if display is None and m.get("xids"):
-        targets = [n for n in targets if n != int(m["display"])]
     if not targets:
         print("нет активных сессий на этой машине")
         return
@@ -468,52 +468,74 @@ def cmd_stop(cfg: dict, display: int) -> None:
     registry_save(reg)
 
 
-# ───────────────────────── зеркало уже открытых окон (X11) ─────────────────────────
-# Окно, запущенное без windrift, переносится «зеркалом»: `xpra shadow :0,windows=xid=…`
-# показывает соседу участок экрана с этим окном и подаёт обратно ввод (XTEST).
-# Программа не перезапускается. Ограничение X11-захвата: оригинал должен оставаться
-# видимым и не перекрытым — xpra снимает экран там, где стоит окно.
+# ───────────────────────── зеркало уже открытых окон ─────────────────────────
+# Окно, запущенное без windrift, переносится «зеркалом», без перезапуска программы:
+# владелец снимает само окно (X11: ximagesrc xid=…, композитинг даёт содержимое даже
+# перекрытого окна), кодирует H.264 с низкой задержкой и шлёт по UDP; сосед показывает
+# поток в окне-копии (`windrift view`). Ввод из копии обратно — этап M2.
 
-def mirror_path() -> Path:
+STREAM_FPS = 30
+
+
+def streams_path() -> Path:
     RUNTIME.mkdir(parents=True, exist_ok=True)
-    return RUNTIME / "mirror.json"
+    return RUNTIME / "streams.json"
 
 
-def mirror_load() -> dict:
-    p = mirror_path()
-    return json.loads(p.read_text()) if p.exists() else {}
+def streams_load() -> dict:
+    """Окна, которые эта машина транслирует соседу: {xid: {pid, title, port}}."""
+    p = streams_path()
+    data = json.loads(p.read_text()) if p.exists() else {}
+    alive = {k: v for k, v in data.items() if pid_alive(v.get("pid", 0))}
+    if alive != data:
+        streams_save(alive)
+    return alive
 
 
-def mirror_save(m: dict) -> None:
-    if m.get("xids"):
-        mirror_path().write_text(json.dumps(m, ensure_ascii=False))
-    else:
-        mirror_path().unlink(missing_ok=True)
+def streams_save(d: dict) -> None:
+    streams_path().write_text(json.dumps(d, ensure_ascii=False))
 
 
-def local_x_display() -> int:
-    """Номер X-дисплея этой сессии: ':0.0' → 0."""
-    d = os.environ.get("DISPLAY", "")
+def views_path() -> Path:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    return RUNTIME / "views.json"
+
+
+def views_load() -> dict:
+    """Окна-копии, которые эта машина показывает: {id: {pid, owner, port}}."""
+    p = views_path()
+    data = json.loads(p.read_text()) if p.exists() else {}
+    alive = {k: v for k, v in data.items() if pid_alive(v.get("pid", 0))}
+    if alive != data:
+        views_save(alive)
+    return alive
+
+
+def views_save(d: dict) -> None:
+    views_path().write_text(json.dumps(d, ensure_ascii=False))
+
+
+def pid_alive(pid: int) -> bool:
     try:
-        return int(d.split(":", 1)[1].split(".", 1)[0])
-    except (IndexError, ValueError):
-        raise WindriftError(f"не понимаю DISPLAY={d!r}")
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
-def is_mirror(display: int) -> bool:
-    m = mirror_load()
-    return bool(m.get("xids")) and int(m.get("display", -1)) == display
+def kill_group(pid: int) -> None:
+    import signal
+    try:
+        os.killpg(int(pid), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
 
 
 def window_rect(xid: int) -> tuple[int, int, int, int]:
-    """Положение и размер окна на экране (без рамки), обрезанные по экрану."""
+    """Положение и размер окна на экране (без рамки)."""
     g = run_out(["xdotool", "getwindowgeometry", "--shell", str(xid)])
     geo = dict(line.split("=", 1) for line in g.split() if "=" in line)
-    x, y, w, h = (int(geo[k]) for k in ("X", "Y", "WIDTH", "HEIGHT"))
-    sw, sh = map(int, run_out(["xdotool", "getdisplaygeometry"]).split())
-    x, y = max(0, x), max(0, y)
-    w, h = max(1, min(w, sw - x)), max(1, min(h, sh - y))
-    return x, y, w, h
+    return tuple(int(geo[k]) for k in ("X", "Y", "WIDTH", "HEIGHT"))
 
 
 def window_title(xid: int) -> str:
@@ -523,47 +545,165 @@ def window_title(xid: int) -> str:
         return hex(xid)
 
 
-def mirror_stop(display: int, restore_focus: bool = True) -> None:
-    m = mirror_load()
-    subprocess.run(["xpra", "stop", f":{display}"], capture_output=True, timeout=20)
-    if restore_focus and m.get("xids"):
-        subprocess.run(["xdotool", "windowactivate", str(m["xids"][-1])], capture_output=True)
-    mirror_save({})
-    log(f"зеркало :{display} остановлено, окна снова только здесь")
+def free_udp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("0.0.0.0", 0))
+        return s.getsockname()[1]
 
 
-def mirror_start(xid: int) -> int:
-    """Добавить окно в зеркало (xpra shadow) и вернуть номер дисплея для подключения."""
-    if session_kind() != "x11":
-        raise WindriftError("перенос уже открытых окон пока работает только с X11-стола "
-                            "(с Wayland — этап C); здесь переносятся окна из `windrift run`")
-    display = local_x_display()
-    m = mirror_load()
-    xids = [x for x in m.get("xids", []) if x != xid] + [xid]
-    if m.get("xids"):
-        # xpra shadow не умеет добавлять окна на лету — перезапускаем с полным списком
-        subprocess.run(["xpra", "stop", f":{display}"], capture_output=True, timeout=20)
-        time.sleep(1)
-    # режим windows=xid=… в xpra 6.5.x падает (TypeError в X11ShadowModel), поэтому
-    # просим прямоугольники экрана, где стоят окна: WxH@XxY, через «/»
-    geoms = [window_rect(x) for x in xids]
-    spec = f":{display},geometry=" + "/".join(f"{w}x{h}@{x}x{y}" for x, y, w, h in geoms)
-    cmd = ["xpra", "shadow", spec, "--daemon=yes", "--attach=no", "--sharing=no",
-           "--tray=no", "--notifications=no", "--mdns=no", "--printing=no", "--webcam=no",
-           "--splash=no", "--clipboard=no", *media_opts_mirror()]
-    log(f"зеркало: {shlex.join(cmd)}")
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if r.returncode != 0:
-        raise WindriftError(f"xpra shadow не запустился: {(r.stderr or r.stdout).strip()[-300:]}")
-    mirror_save({"display": display, "xids": xids, "titles": [window_title(x) for x in xids]})
-    # оригинал должен быть виден целиком — поднимаем его наверх
-    subprocess.run(["xdotool", "windowraise", str(xid)], capture_output=True)
-    return display
+def stream_pipeline(xid: int, w: int, h: int, host: str, port: int) -> list[str]:
+    w, h = max(2, w // 2 * 2), max(2, h // 2 * 2)   # x264 требует чётные размеры
+    kbps = max(2000, min(20000, w * h * STREAM_FPS // 3000))
+    return ["gst-launch-1.0", "-q",
+            "ximagesrc", f"xid={xid}", "use-damage=false", "show-pointer=false", "!",
+            f"video/x-raw,framerate={STREAM_FPS}/1", "!", "videoconvert", "!", "videoscale", "!",
+            f"video/x-raw,format=I420,width={w},height={h}", "!",
+            "x264enc", "tune=zerolatency", "speed-preset=ultrafast", f"bitrate={kbps}",
+            f"key-int-max={STREAM_FPS}", "!",
+            "rtph264pay", "config-interval=1", "pt=96", "mtu=1400", "!",
+            "udpsink", f"host={host}", f"port={port}", "sync=false"]
 
 
-def media_opts_mirror() -> list[str]:
-    # звук у зеркала не нужен: программа и так играет на этой машине
-    return ["--speaker=no", "--microphone=no"]
+def cmd_stream(xid: int, host: str, port: int) -> None:
+    """Транслировать окно, пока оно существует; при смене размера — перезапуск потока."""
+    if not shutil.which("gst-launch-1.0"):
+        raise WindriftError("нет GStreamer: windrift setup-peer поставит его соседу; "
+                            "здесь — gstreamer, gst-plugins-good/ugly/libav")
+    proc, size = None, None
+    try:
+        while True:
+            try:
+                _, _, w, h = window_rect(xid)
+            except (WindriftError, subprocess.TimeoutExpired):
+                log(f"окно {xid:#x} закрыто — трансляция окончена")
+                return
+            if (w, h) != size or proc is None or proc.poll() is not None:
+                if proc and proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                size = (w, h)
+                proc = subprocess.Popen(stream_pipeline(xid, w, h, host, port),
+                                        stdin=subprocess.DEVNULL)
+                log(f"трансляция {xid:#x} {w}x{h} → {host}:{port}")
+            time.sleep(1)
+    finally:
+        if proc and proc.poll() is None:
+            proc.terminate()
+
+
+def stream_start(cfg: dict, xid: int, geom: dict | None) -> None:
+    title = window_title(xid)
+    _, _, w, h = window_rect(xid)
+    reply = send_peer(cfg, {"cmd": "view_open", "owner": cfg["name"], "id": xid,
+                            "title": title, "w": w, "h": h, "geom": geom})
+    if not reply.get("ok"):
+        raise WindriftError(f"сосед не открыл окно-копию: {reply.get('error')}")
+    port = int(reply["port"])
+    pid = spawn_detached([sys.executable, os.path.realpath(__file__), "stream",
+                          str(xid), cfg["peer"]["host"], str(port)])
+    streams = streams_load()
+    streams[str(xid)] = {"pid": pid, "title": title, "port": port}
+    streams_save(streams)
+    log(f"окно {title!r} транслируется на {cfg['peer']['name']} (без перезапуска)")
+
+
+def stream_stop(cfg: dict, xid: int, tell_peer: bool = True) -> None:
+    streams = streams_load()
+    info = streams.pop(str(xid), None)
+    streams_save(streams)
+    if info:
+        kill_group(info["pid"])
+    if tell_peer:
+        try:
+            send_peer(cfg, {"cmd": "view_close", "owner": cfg["name"], "id": xid}, timeout=3)
+        except (OSError, WindriftError):
+            pass
+    if session_kind() == "x11":
+        subprocess.run(["xdotool", "windowactivate", str(xid)], capture_output=True)
+    log(f"окно {xid:#x} снова только здесь")
+
+
+def view_open(msg: dict) -> int:
+    port = free_udp_port()
+    pid = spawn_detached([sys.executable, os.path.realpath(__file__), "view",
+                          "--owner", msg["owner"], "--id", str(msg["id"]), "--port", str(port),
+                          "--title", msg.get("title", ""), "--size", f"{msg.get('w', 800)}x{msg.get('h', 600)}"])
+    views = views_load()
+    views[str(msg["id"])] = {"pid": pid, "owner": msg["owner"], "port": port}
+    views_save(views)
+    return port
+
+
+def view_close(view_id: int) -> None:
+    views = views_load()
+    info = views.pop(str(view_id), None)
+    views_save(views)
+    if info:
+        kill_group(info["pid"])
+
+
+def parse_view_args(args: list[str]) -> tuple[str, int] | None:
+    """Окно-копия? → (владелец, id окна у владельца)."""
+    if "view" not in args or "--owner" not in args or "--id" not in args:
+        return None
+    return args[args.index("--owner") + 1], int(args[args.index("--id") + 1])
+
+
+def cmd_view(cfg_path: Path, owner: str, view_id: int, port: int, title: str, size: str) -> None:
+    """Окно-копия: принять поток H.264 по UDP и показать (GTK4 + GStreamer appsink)."""
+    try:
+        import gi
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Gst", "1.0")
+        from gi.repository import GLib, Gdk, Gst, Gtk
+    except (ImportError, ValueError):
+        raise WindriftError("для окна-копии нужны GTK4 и gst-python (python3-gst-1.0)")
+    Gst.init(None)
+    w0, h0 = (int(v) for v in size.split("x"))
+    pipeline = Gst.parse_launch(
+        f"udpsrc port={port} caps=\"application/x-rtp,media=video,encoding-name=H264,"
+        "payload=96,clock-rate=90000\" ! rtpjitterbuffer latency=30 drop-on-latency=true ! "
+        "rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw,format=RGBA ! "
+        "appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true")
+    sink = pipeline.get_by_name("sink")
+
+    def on_activate(app):
+        win = Gtk.ApplicationWindow(application=app, title=f"{title} — {owner}")
+        win.set_default_size(w0, h0)
+        picture = Gtk.Picture(can_shrink=True, content_fit=Gtk.ContentFit.CONTAIN)
+        win.set_child(picture)
+
+        def on_sample(appsink):
+            sample = appsink.emit("pull-sample")
+            caps = sample.get_caps().get_structure(0)
+            w, h = caps.get_value("width"), caps.get_value("height")
+            buf = sample.get_buffer()
+            ok, info = buf.map(Gst.MapFlags.READ)
+            if ok:
+                data = GLib.Bytes.new(info.data)
+                buf.unmap(info)
+                tex = Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.R8G8B8A8, data, w * 4)
+                GLib.idle_add(lambda: picture.set_paintable(tex) and False)
+            return Gst.FlowReturn.OK
+
+        sink.connect("new-sample", on_sample)
+
+        def on_close(_w):
+            pipeline.set_state(Gst.State.NULL)
+            try:   # копию закрыли руками — владелец перестаёт транслировать
+                send_peer(load_config(cfg_path), {"cmd": "view_return", "id": view_id}, timeout=2)
+            except (OSError, WindriftError):
+                pass
+            return False
+
+        win.connect("close-request", on_close)
+        pipeline.set_state(Gst.State.PLAYING)
+        win.present()
+
+    app = Gtk.Application(application_id=f"io.github.windrift.View{view_id}")
+    app.connect("activate", on_activate)
+    app.run([])
+    pipeline.set_state(Gst.State.NULL)
 
 
 # ───────────────────────── бэкенды композиторов ─────────────────────────
@@ -694,6 +834,18 @@ def window_geometry(backend: str) -> dict | None:
 def cmd_send(cfg: dict) -> None:
     pid = focused_pid(cfg["backend"])
     geom = window_geometry(cfg["backend"])
+    view = None
+    try:
+        view = parse_view_args(proc_args(pid))
+    except (OSError, ValueError):
+        pass
+    if view:
+        # хоткей на окне-копии: вернуть окно владельцу
+        owner, view_id = view
+        log(f"возвращаю окно {view_id:#x} на {owner}")
+        send_peer(cfg, {"cmd": "view_return", "id": view_id})
+        view_close(view_id)
+        return
     try:
         owner, display = window_session(cfg, pid)
     except (WindriftError, OSError, ValueError):
@@ -701,13 +853,12 @@ def cmd_send(cfg: dict) -> None:
         if resolve_backend(cfg["backend"]) != "x11":
             raise
         xid = int(run_out(["xdotool", "getactivewindow"]).strip())
-        m = mirror_load()
-        if xid in m.get("xids", []):
+        if str(xid) in streams_load():
             # тот же хоткей на оригинале, пока он показан у соседа, — вернуть
-            mirror_stop(int(m["display"]))
-            return
-        log(f"окно {window_title(xid)!r} не из windrift — переношу зеркалом (без перезапуска)")
-        owner, display = cfg["name"], mirror_start(xid)
+            stream_stop(cfg, xid)
+        else:
+            stream_start(cfg, xid, geom)
+        return
     log(f"окно pid={pid}: сессия :{display}, владелец {owner} → отправляю на {cfg['peer']['name']}"
         + (f" (доля экрана {geom['w']:.0%}×{geom['h']:.0%})" if geom else ""))
     reply = send_peer(cfg, {"cmd": "attach", "owner": owner, "display": display, "geom": geom})
@@ -783,9 +934,14 @@ async def handle(reader, writer, cfg: dict, clip: Clipboard | None) -> None:
         cmd = msg.get("cmd")
         if cmd == "ping":
             reply = {"ok": True, "name": cfg["name"]}
-        elif cmd == "attach" and msg["owner"] == cfg["name"] and is_mirror(int(msg["display"])):
-            # окно-зеркало возвращают домой: оригинал и так здесь, просто выключаем зеркало
-            mirror_stop(int(msg["display"]))
+        elif cmd == "view_open":
+            reply = {"ok": True, "port": view_open(msg)}
+            log(f"окно-копия {msg.get('title')!r} от {msg['owner']}, порт {reply['port']}")
+        elif cmd == "view_close":
+            view_close(int(msg["id"]))
+            reply = {"ok": True}
+        elif cmd == "view_return":
+            stream_stop(cfg, int(msg["id"]), tell_peer=False)
             reply = {"ok": True}
         elif cmd == "attach":
             argv = attach_cmd(cfg, msg["owner"], int(msg["display"]))
@@ -1654,6 +1810,15 @@ def main() -> None:
     p_stop = sub.add_parser("stop", help="остановить сессию")
     p_stop.add_argument("display", type=int)
     sub.add_parser("doctor", help="проверить окружение")
+    p_stream = sub.add_parser("stream", help=argparse.SUPPRESS)
+    p_stream.add_argument("xid", type=int)
+    p_stream.add_argument("host")
+    p_stream.add_argument("port", type=int)
+    p_view = sub.add_parser("view", help=argparse.SUPPRESS)
+    for a_ in ("--owner", "--title", "--size"):
+        p_view.add_argument(a_, default="")
+    p_view.add_argument("--id", type=int, required=True)
+    p_view.add_argument("--port", type=int, required=True)
     p_mouse = sub.add_parser("mouse", help="общая мышь через Deskflow: сервер здесь, клиент у соседа")
     p_mouse.add_argument("action", nargs="?", default="start", choices=["start", "stop", "setup", "deskflow"],
                          help="setup — собрать и настроить lan-mouse на обеих машинах (мышь в обе стороны); "
@@ -1672,6 +1837,8 @@ def main() -> None:
             case "back": cmd_back(load_config(a.config), a.display)
             case "stop": cmd_stop(load_config(a.config), a.display)
             case "doctor": cmd_doctor(load_config(a.config))
+            case "stream": cmd_stream(a.xid, a.host, a.port)
+            case "view": cmd_view(a.config, a.owner, a.id, a.port, a.title, a.size or "800x600")
             case "mouse": cmd_mouse(load_config(a.config), a.config, a.action)
     except (WindriftError, OSError, subprocess.CalledProcessError) as e:
         notify(f"ошибка: {e}")

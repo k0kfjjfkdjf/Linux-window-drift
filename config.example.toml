@@ -91,10 +91,10 @@ attach_args = []
 [setup]
 repo = "https://github.com/k0kfjjfkdjf/Linux-window-drift.git"
 dir = "~/Linux-window-drift"
-packages = ["git", "xpra", "wl-clipboard", "python", "openssh", "libnotify", "python-gobject", "gtk4"]
+packages = ["git", "xpra", "wl-clipboard", "python", "openssh", "libnotify", "python-gobject", "gtk4", "gstreamer", "gst-plugins-base", "gst-plugins-good", "gst-plugins-ugly", "gst-libav", "gst-python"]
 # дополнительные пакеты для соседа на Arch (pacman); обязательные ставятся всегда
 
-packages_apt = ["git", "xpra", "xpra-x11", "python3", "xclip", "xdotool", "x11-utils", "wl-clipboard", "libnotify-bin", "openssh-server", "python3-gi", "gir1.2-gtk-4.0"]
+packages_apt = ["git", "xpra", "xpra-x11", "python3", "xclip", "xdotool", "x11-utils", "wl-clipboard", "gstreamer1.0-tools", "gstreamer1.0-plugins-base", "gstreamer1.0-plugins-good", "gstreamer1.0-plugins-ugly", "gstreamer1.0-libav", "gstreamer1.0-x", "python3-gst-1.0", "gir1.2-gst-plugins-base-1.0", "libnotify-bin", "openssh-server", "python3-gi", "gir1.2-gtk-4.0"]
 # дополнительные пакеты для соседа на Debian/Ubuntu/Armbian (apt); обязательные ставятся всегда
 
 xpra_channel = "stable"
