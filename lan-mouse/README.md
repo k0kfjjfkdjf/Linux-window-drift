@@ -18,3 +18,11 @@ git clone https://github.com/feschber/lan-mouse && cd lan-mouse
 git checkout $(cat ../UPSTREAM_COMMIT) && git apply ../x11-input-capture.patch
 cargo build --release --no-default-features --features x11_capture,x11_emulation
 ```
+
+## Hyprland: повторный захват сразу после возврата
+
+`hyprland-reenter-guard.patch` (только для Wayland-сборки): Hyprland после снятия
+захвата иногда сразу снова присылает `wl_pointer.enter` для полоски у края, и lan-mouse
+тут же захватывает мышь обратно, а через секунду Hyprland отбирает захват
+(`compositor released mouse`). Патч игнорирует вход в полоску в первые 300 мс после
+возврата и пишет в лог входы/выходы курсора для диагностики.
