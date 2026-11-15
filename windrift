@@ -1103,7 +1103,9 @@ def cmd_mouse_setup(cfg: dict, config_path: Path) -> None:
     if not bin_path:
         raise WindriftError("здесь нет lan-mouse: положи сборку в ~/.local/bin/lan-mouse "
                             "или поставь пакет (pacman -S lan-mouse)")
-    repo = Path(os.path.realpath(__file__)).parent
+    # патч лежит в папке проекта (setup.dir), а не рядом с установленным ~/.local/bin/windrift
+    candidates = [Path(os.path.expanduser(cfg["setup"]["dir"])), Path(os.path.realpath(__file__)).parent]
+    repo = next((c for c in candidates if (c / "lan-mouse" / "x11-input-capture.patch").exists()), candidates[0])
     patch = repo / "lan-mouse" / "x11-input-capture.patch"
     commit_file = repo / "lan-mouse" / "UPSTREAM_COMMIT"
     s = cfg["setup"]
