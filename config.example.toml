@@ -79,7 +79,7 @@ dir = "~/Linux-window-drift"
 packages = ["git", "xpra", "wl-clipboard", "python", "openssh", "libnotify", "python-gobject", "gtk4"]
 # пакеты для соседа на Arch (pacman)
 
-packages_apt = ["git", "xpra", "python3", "xclip", "xdotool", "wl-clipboard", "libnotify-bin", "openssh-server", "python3-gi", "gir1.2-gtk-4.0"]
+packages_apt = ["git", "xpra", "xpra-x11", "python3", "xclip", "xdotool", "wl-clipboard", "libnotify-bin", "openssh-server", "python3-gi", "gir1.2-gtk-4.0"]
 # пакеты для соседа на Debian/Ubuntu/Armbian (apt)
 
 xpra_channel = "stable"
