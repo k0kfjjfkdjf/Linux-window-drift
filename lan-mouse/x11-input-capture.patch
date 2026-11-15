@@ -1,0 +1,474 @@
+diff --git a/input-capture/src/error.rs b/input-capture/src/error.rs
+index 592e40f..b9bd6ce 100644
+--- a/input-capture/src/error.rs
++++ b/input-capture/src/error.rs
+@@ -137,8 +137,10 @@ pub enum LayerShellCaptureCreationError {
+ #[cfg(x11)]
+ #[derive(Debug, Error)]
+ pub enum X11InputCaptureCreationError {
+-    #[error("X11 input capture is not yet implemented :(")]
+-    NotImplemented,
++    #[error("could not open the X11 display (is DISPLAY set?)")]
++    OpenDisplay,
++    #[error("could not start the X11 capture thread")]
++    Thread,
+ }
+ 
+ #[cfg(target_os = "macos")]
+diff --git a/input-capture/src/x11.rs b/input-capture/src/x11.rs
+index 6fc917e..ed3c11f 100644
+--- a/input-capture/src/x11.rs
++++ b/input-capture/src/x11.rs
+@@ -1,44 +1,438 @@
+-use std::task::Poll;
++//! X11 input capture.
++//!
++//! A dedicated thread owns its own Xlib connection. While no capture is active it
++//! polls the pointer position; when the pointer hits a screen edge that has a
++//! client configured, it grabs pointer and keyboard on the root window, hides the
++//! cursor and forwards relative motion, buttons, scroll and keys until `release`.
++//!
++//! Relative motion is measured against the screen center: every motion event is
++//! turned into a delta from the center and the pointer is warped back (the same
++//! technique Synergy/Deskflow use on X11), so pointer acceleration configured on
++//! this machine is preserved.
++
++use std::{
++    collections::HashSet,
++    os::raw::{c_char, c_uint},
++    ptr,
++    sync::mpsc as std_mpsc,
++    task::Poll,
++    thread,
++    time::Duration,
++};
+ 
+ use async_trait::async_trait;
+ use futures_core::Stream;
++use input_event::{
++    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
++};
++use tokio::sync::mpsc;
++use x11::xlib;
+ 
+ use super::{Capture, CaptureError, CaptureEvent, Position, error::X11InputCaptureCreationError};
+ 
+-pub struct X11InputCapture {}
++/// poll interval while waiting for the pointer to hit an edge
++const IDLE_POLL: Duration = Duration::from_millis(8);
++/// poll interval while capturing and no events are pending
++const ACTIVE_POLL: Duration = Duration::from_millis(1);
++
++enum Command {
++    Create(Position),
++    Destroy(Position),
++    Release,
++    Terminate,
++}
++
++type Item = Result<(Position, CaptureEvent), CaptureError>;
++
++pub struct X11InputCapture {
++    commands: std_mpsc::Sender<Command>,
++    events: mpsc::UnboundedReceiver<Item>,
++    thread: Option<thread::JoinHandle<()>>,
++}
+ 
+ impl X11InputCapture {
+     pub fn new() -> std::result::Result<Self, X11InputCaptureCreationError> {
+-        Err(X11InputCaptureCreationError::NotImplemented)
++        let (cmd_tx, cmd_rx) = std_mpsc::channel();
++        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
++        let (ready_tx, ready_rx) = std_mpsc::channel();
++        let thread = thread::Builder::new()
++            .name("x11-input-capture".into())
++            .spawn(move || match CaptureThread::open() {
++                Ok(mut t) => {
++                    let _ = ready_tx.send(Ok(()));
++                    t.run(cmd_rx, ev_tx);
++                }
++                Err(e) => {
++                    let _ = ready_tx.send(Err(e));
++                }
++            })
++            .map_err(|_| X11InputCaptureCreationError::Thread)?;
++        ready_rx
++            .recv()
++            .map_err(|_| X11InputCaptureCreationError::Thread)??;
++        Ok(Self {
++            commands: cmd_tx,
++            events: ev_rx,
++            thread: Some(thread),
++        })
++    }
++
++    fn send(&self, cmd: Command) -> Result<(), CaptureError> {
++        // the thread only goes away after `terminate`
++        let _ = self.commands.send(cmd);
++        Ok(())
++    }
++}
++
++impl Drop for X11InputCapture {
++    fn drop(&mut self) {
++        let _ = self.commands.send(Command::Terminate);
++        if let Some(t) = self.thread.take() {
++            let _ = t.join();
++        }
+     }
+ }
+ 
+ #[async_trait]
+ impl Capture for X11InputCapture {
+-    async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
+-        Ok(())
++    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
++        self.send(Command::Create(pos))
+     }
+ 
+-    async fn destroy(&mut self, _pos: Position) -> Result<(), CaptureError> {
+-        Ok(())
++    async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
++        self.send(Command::Destroy(pos))
+     }
+ 
+     async fn release(&mut self) -> Result<(), CaptureError> {
+-        Ok(())
++        self.send(Command::Release)
+     }
+ 
+     async fn terminate(&mut self) -> Result<(), CaptureError> {
+-        Ok(())
++        self.send(Command::Terminate)
+     }
+ }
+ 
+ impl Stream for X11InputCapture {
+-    type Item = Result<(Position, CaptureEvent), CaptureError>;
++    type Item = Item;
+ 
+     fn poll_next(
+-        self: std::pin::Pin<&mut Self>,
+-        _cx: &mut std::task::Context<'_>,
+-    ) -> std::task::Poll<Option<Self::Item>> {
+-        Poll::Pending
++        mut self: std::pin::Pin<&mut Self>,
++        cx: &mut std::task::Context<'_>,
++    ) -> Poll<Option<Self::Item>> {
++        self.events.poll_recv(cx)
++    }
++}
++
++struct CaptureThread {
++    display: *mut xlib::Display,
++    root: xlib::Window,
++    width: i32,
++    height: i32,
++    invisible_cursor: xlib::Cursor,
++    /// edges with a client behind them
++    positions: HashSet<Position>,
++    /// active capture and the pointer position where it started
++    active: Option<(Position, i32, i32)>,
++    /// an edge only triggers after the pointer has been away from all edges,
++    /// so a released pointer does not get captured again immediately
++    armed: bool,
++    /// keys currently held, to drop X autorepeat presses
++    pressed_keys: HashSet<u32>,
++}
++
++impl CaptureThread {
++    fn open() -> Result<Self, X11InputCaptureCreationError> {
++        unsafe {
++            let display = xlib::XOpenDisplay(ptr::null());
++            if display.is_null() {
++                return Err(X11InputCaptureCreationError::OpenDisplay);
++            }
++            let screen = xlib::XDefaultScreen(display);
++            let root = xlib::XRootWindow(display, screen);
++            let width = xlib::XDisplayWidth(display, screen);
++            let height = xlib::XDisplayHeight(display, screen);
++            // report autorepeat as repeated presses only (no fake releases)
++            xlib::XkbSetDetectableAutoRepeat(display, xlib::True, ptr::null_mut());
++            let invisible_cursor = make_invisible_cursor(display, root);
++            Ok(Self {
++                display,
++                root,
++                width,
++                height,
++                invisible_cursor,
++                positions: HashSet::new(),
++                active: None,
++                armed: false,
++                pressed_keys: HashSet::new(),
++            })
++        }
++    }
++
++    fn run(&mut self, commands: std_mpsc::Receiver<Command>, events: mpsc::UnboundedSender<Item>) {
++        loop {
++            loop {
++                match commands.try_recv() {
++                    Ok(Command::Create(pos)) => {
++                        self.positions.insert(pos);
++                    }
++                    Ok(Command::Destroy(pos)) => {
++                        self.positions.remove(&pos);
++                        if matches!(self.active, Some((p, _, _)) if p == pos) {
++                            self.ungrab(false);
++                        }
++                    }
++                    Ok(Command::Release) => self.ungrab(true),
++                    Ok(Command::Terminate) | Err(std_mpsc::TryRecvError::Disconnected) => {
++                        self.ungrab(false);
++                        return;
++                    }
++                    Err(std_mpsc::TryRecvError::Empty) => break,
++                }
++            }
++
++            if self.active.is_some() {
++                if !self.forward_events(&events) {
++                    thread::sleep(ACTIVE_POLL);
++                }
++            } else {
++                self.check_edges(&events);
++                thread::sleep(IDLE_POLL);
++            }
++        }
++    }
++
++    fn pointer_position(&self) -> Option<(i32, i32)> {
++        let (mut root_ret, mut child_ret) = (0, 0);
++        let (mut x, mut y, mut wx, mut wy) = (0, 0, 0, 0);
++        let mut mask: c_uint = 0;
++        let ok = unsafe {
++            xlib::XQueryPointer(
++                self.display,
++                self.root,
++                &mut root_ret,
++                &mut child_ret,
++                &mut x,
++                &mut y,
++                &mut wx,
++                &mut wy,
++                &mut mask,
++            )
++        };
++        // don't start a capture while a button is held (dragging, selecting)
++        let buttons = xlib::Button1Mask | xlib::Button2Mask | xlib::Button3Mask;
++        (ok != 0 && mask & buttons == 0).then_some((x, y))
++    }
++
++    fn edge_at(&self, x: i32, y: i32) -> Option<Position> {
++        [
++            (Position::Left, x <= 0),
++            (Position::Right, x >= self.width - 1),
++            (Position::Top, y <= 0),
++            (Position::Bottom, y >= self.height - 1),
++        ]
++        .into_iter()
++        .find(|(pos, hit)| *hit && self.positions.contains(pos))
++        .map(|(pos, _)| pos)
++    }
++
++    fn check_edges(&mut self, events: &mpsc::UnboundedSender<Item>) {
++        if self.positions.is_empty() {
++            return;
++        }
++        let Some((x, y)) = self.pointer_position() else {
++            return;
++        };
++        match self.edge_at(x, y) {
++            None => self.armed = true,
++            Some(pos) if self.armed => {
++                if self.grab() {
++                    log::debug!("X11 capture: pointer hit {pos} edge at ({x}, {y})");
++                    self.active = Some((pos, x, y));
++                    self.pressed_keys.clear();
++                    self.warp_to_center();
++                    let _ = events.send(Ok((pos, CaptureEvent::Begin)));
++                }
++            }
++            Some(_) => {}
++        }
++    }
++
++    fn grab(&self) -> bool {
++        unsafe {
++            let mask =
++                (xlib::ButtonPressMask | xlib::ButtonReleaseMask | xlib::PointerMotionMask) as c_uint;
++            let p = xlib::XGrabPointer(
++                self.display,
++                self.root,
++                xlib::False,
++                mask,
++                xlib::GrabModeAsync,
++                xlib::GrabModeAsync,
++                0,
++                self.invisible_cursor,
++                xlib::CurrentTime,
++            );
++            if p != xlib::GrabSuccess {
++                log::warn!("X11 capture: pointer grab failed ({p}), another client holds a grab");
++                return false;
++            }
++            let k = xlib::XGrabKeyboard(
++                self.display,
++                self.root,
++                xlib::False,
++                xlib::GrabModeAsync,
++                xlib::GrabModeAsync,
++                xlib::CurrentTime,
++            );
++            if k != xlib::GrabSuccess {
++                log::warn!("X11 capture: keyboard grab failed ({k})");
++                xlib::XUngrabPointer(self.display, xlib::CurrentTime);
++                xlib::XFlush(self.display);
++                return false;
++            }
++            // drop events queued before the grab
++            xlib::XSync(self.display, xlib::True);
++            true
++        }
++    }
++
++    /// end the capture; with `restore` the pointer goes back where it entered the edge
++    fn ungrab(&mut self, restore: bool) {
++        let Some((_, x, y)) = self.active.take() else {
++            return;
++        };
++        unsafe {
++            xlib::XUngrabKeyboard(self.display, xlib::CurrentTime);
++            xlib::XUngrabPointer(self.display, xlib::CurrentTime);
++            if restore {
++                xlib::XWarpPointer(self.display, 0, self.root, 0, 0, 0, 0, x, y);
++            }
++            xlib::XFlush(self.display);
++        }
++        self.armed = false;
++        self.pressed_keys.clear();
++    }
++
++    fn center(&self) -> (i32, i32) {
++        (self.width / 2, self.height / 2)
++    }
++
++    fn warp_to_center(&self) {
++        let (cx, cy) = self.center();
++        unsafe {
++            xlib::XWarpPointer(self.display, 0, self.root, 0, 0, 0, 0, cx, cy);
++            xlib::XFlush(self.display);
++        }
++    }
++
++    /// forward all pending events, returns false if there were none
++    fn forward_events(&mut self, events: &mpsc::UnboundedSender<Item>) -> bool {
++        let Some((pos, _, _)) = self.active else {
++            return false;
++        };
++        let pending = unsafe { xlib::XPending(self.display) };
++        if pending == 0 {
++            return false;
++        }
++        let (cx, cy) = self.center();
++        let (mut dx, mut dy, mut time) = (0i32, 0i32, 0u32);
++        let send = |e: Event| {
++            let _ = events.send(Ok((pos, CaptureEvent::Input(e))));
++        };
++        for _ in 0..pending {
++            let mut ev: xlib::XEvent = unsafe { std::mem::zeroed() };
++            unsafe { xlib::XNextEvent(self.display, &mut ev) };
++            match ev.get_type() {
++                xlib::MotionNotify => {
++                    let m: xlib::XMotionEvent = ev.into();
++                    dx += m.x_root - cx;
++                    dy += m.y_root - cy;
++                    time = m.time as u32;
++                }
++                t @ (xlib::ButtonPress | xlib::ButtonRelease) => {
++                    let b: xlib::XButtonEvent = ev.into();
++                    let pressed = t == xlib::ButtonPress;
++                    match b.button {
++                        // wheel: one press per tick, releases carry no information
++                        4..=7 => {
++                            if pressed {
++                                let (axis, value) = match b.button {
++                                    4 => (0, -120),
++                                    5 => (0, 120),
++                                    6 => (1, -120),
++                                    _ => (1, 120),
++                                };
++                                send(Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value }));
++                            }
++                        }
++                        n => {
++                            let button = match n {
++                                1 => BTN_LEFT,
++                                2 => BTN_MIDDLE,
++                                3 => BTN_RIGHT,
++                                8 => BTN_BACK,
++                                9 => BTN_FORWARD,
++                                _ => continue,
++                            };
++                            send(Event::Pointer(PointerEvent::Button {
++                                time: b.time as u32,
++                                button,
++                                state: pressed as u32,
++                            }));
++                        }
++                    }
++                }
++                t @ (xlib::KeyPress | xlib::KeyRelease) => {
++                    let k: xlib::XKeyEvent = ev.into();
++                    // X keycodes are evdev scancodes shifted by 8
++                    let Some(key) = k.keycode.checked_sub(8) else {
++                        continue;
++                    };
++                    let pressed = t == xlib::KeyPress;
++                    if pressed && !self.pressed_keys.insert(key) {
++                        continue; // autorepeat, the peer repeats on its own
++                    }
++                    if !pressed {
++                        self.pressed_keys.remove(&key);
++                    }
++                    send(Event::Keyboard(KeyboardEvent::Key {
++                        time: k.time as u32,
++                        key,
++                        state: pressed as u8,
++                    }));
++                }
++                _ => {}
++            }
++        }
++        if dx != 0 || dy != 0 {
++            send(Event::Pointer(PointerEvent::Motion {
++                time,
++                dx: dx as f64,
++                dy: dy as f64,
++            }));
++            self.warp_to_center();
++        }
++        true
++    }
++}
++
++impl Drop for CaptureThread {
++    fn drop(&mut self) {
++        unsafe {
++            xlib::XFreeCursor(self.display, self.invisible_cursor);
++            xlib::XCloseDisplay(self.display);
++        }
++    }
++}
++
++unsafe fn make_invisible_cursor(display: *mut xlib::Display, root: xlib::Window) -> xlib::Cursor {
++    unsafe {
++        let data: [c_char; 1] = [0];
++        let pixmap = xlib::XCreateBitmapFromData(display, root, data.as_ptr(), 1, 1);
++        let mut color: xlib::XColor = std::mem::zeroed();
++        let cursor =
++            xlib::XCreatePixmapCursor(display, pixmap, pixmap, &mut color, &mut color, 0, 0);
++        xlib::XFreePixmap(display, pixmap);
++        cursor
+     }
+ }
