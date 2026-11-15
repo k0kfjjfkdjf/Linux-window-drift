@@ -503,6 +503,17 @@ def is_mirror(display: int) -> bool:
     return bool(m.get("xids")) and int(m.get("display", -1)) == display
 
 
+def window_rect(xid: int) -> tuple[int, int, int, int]:
+    """Положение и размер окна на экране (без рамки), обрезанные по экрану."""
+    g = run_out(["xdotool", "getwindowgeometry", "--shell", str(xid)])
+    geo = dict(line.split("=", 1) for line in g.split() if "=" in line)
+    x, y, w, h = (int(geo[k]) for k in ("X", "Y", "WIDTH", "HEIGHT"))
+    sw, sh = map(int, run_out(["xdotool", "getdisplaygeometry"]).split())
+    x, y = max(0, x), max(0, y)
+    w, h = max(1, min(w, sw - x)), max(1, min(h, sh - y))
+    return x, y, w, h
+
+
 def window_title(xid: int) -> str:
     try:
         return run_out(["xdotool", "getwindowname", str(xid)]).strip()
@@ -531,7 +542,10 @@ def mirror_start(xid: int) -> int:
         # xpra shadow не умеет добавлять окна на лету — перезапускаем с полным списком
         subprocess.run(["xpra", "stop", f":{display}"], capture_output=True, timeout=20)
         time.sleep(1)
-    spec = f":{display},windows=" + "/".join(f"xid={x:#x}" for x in xids)
+    # режим windows=xid=… в xpra 6.5.x падает (TypeError в X11ShadowModel), поэтому
+    # просим прямоугольники экрана, где стоят окна: WxH@XxY, через «/»
+    geoms = [window_rect(x) for x in xids]
+    spec = f":{display},geometry=" + "/".join(f"{w}x{h}@{x}x{y}" for x, y, w, h in geoms)
     cmd = ["xpra", "shadow", spec, "--daemon=yes", "--attach=no", "--sharing=no",
            "--tray=no", "--notifications=no", "--mdns=no", "--printing=no", "--webcam=no",
            "--splash=no", *media_opts_mirror()]
