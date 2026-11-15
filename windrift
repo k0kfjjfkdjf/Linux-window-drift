@@ -383,18 +383,30 @@ def cmd_list(cfg: dict) -> None:
             print(f":{n}\t{shlex.join(info['cmd'])}")
     if alive != reg:
         registry_save(alive)   # чистим мёртвые сессии
-    if not alive:
+    m = mirror_load()
+    if m.get("xids"):
+        print(f":{m['display']}\tзеркало: " + ", ".join(m.get("titles", [])))
+    if not alive and not m.get("xids"):
         print("нет активных сессий")
 
 
 def alive_sessions() -> list[int]:
     reg = registry_load()
-    return sorted(int(n) for n in reg if Path(f"/tmp/.X11-unix/X{n}").exists())
+    mirror = mirror_load()
+    skip = {int(mirror["display"])} if mirror.get("xids") else set()
+    return sorted(int(n) for n in reg if Path(f"/tmp/.X11-unix/X{n}").exists() and int(n) not in skip)
 
 
 def cmd_back(cfg: dict, display: int | None) -> None:
     """Вернуть свои окна на эту машину (локальный клиент вытеснит клиента у соседа)."""
+    m = mirror_load()
+    if m.get("xids") and display in (None, int(m["display"])):
+        mirror_stop(int(m["display"]))
+        if display is not None:
+            return
     targets = [display] if display is not None else alive_sessions()
+    if display is None and m.get("xids"):
+        targets = [n for n in targets if n != int(m["display"])]
     if not targets:
         print("нет активных сессий на этой машине")
         return
@@ -452,6 +464,90 @@ def cmd_stop(cfg: dict, display: int) -> None:
     reg = registry_load()
     reg.pop(str(display), None)
     registry_save(reg)
+
+
+# ───────────────────────── зеркало уже открытых окон (X11) ─────────────────────────
+# Окно, запущенное без windrift, переносится «зеркалом»: `xpra shadow :0,windows=xid=…`
+# показывает соседу участок экрана с этим окном и подаёт обратно ввод (XTEST).
+# Программа не перезапускается. Ограничение X11-захвата: оригинал должен оставаться
+# видимым и не перекрытым — xpra снимает экран там, где стоит окно.
+
+def mirror_path() -> Path:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    return RUNTIME / "mirror.json"
+
+
+def mirror_load() -> dict:
+    p = mirror_path()
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+def mirror_save(m: dict) -> None:
+    if m.get("xids"):
+        mirror_path().write_text(json.dumps(m, ensure_ascii=False))
+    else:
+        mirror_path().unlink(missing_ok=True)
+
+
+def local_x_display() -> int:
+    """Номер X-дисплея этой сессии: ':0.0' → 0."""
+    d = os.environ.get("DISPLAY", "")
+    try:
+        return int(d.split(":", 1)[1].split(".", 1)[0])
+    except (IndexError, ValueError):
+        raise WindriftError(f"не понимаю DISPLAY={d!r}")
+
+
+def is_mirror(display: int) -> bool:
+    m = mirror_load()
+    return bool(m.get("xids")) and int(m.get("display", -1)) == display
+
+
+def window_title(xid: int) -> str:
+    try:
+        return run_out(["xdotool", "getwindowname", str(xid)]).strip()
+    except (WindriftError, subprocess.TimeoutExpired):
+        return hex(xid)
+
+
+def mirror_stop(display: int, restore_focus: bool = True) -> None:
+    m = mirror_load()
+    subprocess.run(["xpra", "stop", f":{display}"], capture_output=True, timeout=20)
+    if restore_focus and m.get("xids"):
+        subprocess.run(["xdotool", "windowactivate", str(m["xids"][-1])], capture_output=True)
+    mirror_save({})
+    log(f"зеркало :{display} остановлено, окна снова только здесь")
+
+
+def mirror_start(xid: int) -> int:
+    """Добавить окно в зеркало (xpra shadow) и вернуть номер дисплея для подключения."""
+    if session_kind() != "x11":
+        raise WindriftError("перенос уже открытых окон пока работает только с X11-стола "
+                            "(с Wayland — этап C); здесь переносятся окна из `windrift run`")
+    display = local_x_display()
+    m = mirror_load()
+    xids = [x for x in m.get("xids", []) if x != xid] + [xid]
+    if m.get("xids"):
+        # xpra shadow не умеет добавлять окна на лету — перезапускаем с полным списком
+        subprocess.run(["xpra", "stop", f":{display}"], capture_output=True, timeout=20)
+        time.sleep(1)
+    spec = f":{display},windows=" + "/".join(f"xid={x:#x}" for x in xids)
+    cmd = ["xpra", "shadow", spec, "--daemon=yes", "--attach=no", "--sharing=no",
+           "--tray=no", "--notifications=no", "--mdns=no", "--printing=no", "--webcam=no",
+           "--splash=no", *media_opts_mirror()]
+    log(f"зеркало: {shlex.join(cmd)}")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise WindriftError(f"xpra shadow не запустился: {(r.stderr or r.stdout).strip()[-300:]}")
+    mirror_save({"display": display, "xids": xids, "titles": [window_title(x) for x in xids]})
+    # оригинал должен быть виден целиком — поднимаем его наверх
+    subprocess.run(["xdotool", "windowraise", str(xid)], capture_output=True)
+    return display
+
+
+def media_opts_mirror() -> list[str]:
+    # звук у зеркала не нужен: программа и так играет на этой машине
+    return ["--speaker=no", "--microphone=no"]
 
 
 # ───────────────────────── бэкенды композиторов ─────────────────────────
@@ -581,8 +677,21 @@ def window_geometry(backend: str) -> dict | None:
 
 def cmd_send(cfg: dict) -> None:
     pid = focused_pid(cfg["backend"])
-    owner, display = window_session(cfg, pid)
     geom = window_geometry(cfg["backend"])
+    try:
+        owner, display = window_session(cfg, pid)
+    except (WindriftError, OSError, ValueError):
+        # обычное окно, запущенное без windrift: на X11 переносим зеркалом
+        if resolve_backend(cfg["backend"]) != "x11":
+            raise
+        xid = int(run_out(["xdotool", "getactivewindow"]).strip())
+        m = mirror_load()
+        if xid in m.get("xids", []):
+            # тот же хоткей на оригинале, пока он показан у соседа, — вернуть
+            mirror_stop(int(m["display"]))
+            return
+        log(f"окно {window_title(xid)!r} не из windrift — переношу зеркалом (без перезапуска)")
+        owner, display = cfg["name"], mirror_start(xid)
     log(f"окно pid={pid}: сессия :{display}, владелец {owner} → отправляю на {cfg['peer']['name']}"
         + (f" (доля экрана {geom['w']:.0%}×{geom['h']:.0%})" if geom else ""))
     reply = send_peer(cfg, {"cmd": "attach", "owner": owner, "display": display, "geom": geom})
@@ -658,6 +767,10 @@ async def handle(reader, writer, cfg: dict, clip: Clipboard | None) -> None:
         cmd = msg.get("cmd")
         if cmd == "ping":
             reply = {"ok": True, "name": cfg["name"]}
+        elif cmd == "attach" and msg["owner"] == cfg["name"] and is_mirror(int(msg["display"])):
+            # окно-зеркало возвращают домой: оригинал и так здесь, просто выключаем зеркало
+            mirror_stop(int(msg["display"]))
+            reply = {"ok": True}
         elif cmd == "attach":
             argv = attach_cmd(cfg, msg["owner"], int(msg["display"]))
             log(f"принимаю окно: {shlex.join(argv)}")
