@@ -15,6 +15,7 @@ sharing=no сам отключает старого клиента). Цепоч�
   windrift setup-peer [ssh]     установить и настроить windrift на соседе по SSH
   windrift run <cmd...>         запустить программу в переносимой сессии
   windrift send                 отправить активное окно на соседнюю машину
+  windrift back [N]             вернуть свои окна на эту машину (все или сессию :N)
   windrift daemon               демон: принимает окна и синхронизирует буфер обмена
   windrift list                 показать локальные сессии
   windrift stop <N>             остановить сессию :N
@@ -366,6 +367,52 @@ def cmd_list(cfg: dict) -> None:
         print("нет активных сессий")
 
 
+def alive_sessions() -> list[int]:
+    reg = registry_load()
+    return sorted(int(n) for n in reg if Path(f"/tmp/.X11-unix/X{n}").exists())
+
+
+def cmd_back(cfg: dict, display: int | None) -> None:
+    """Вернуть свои окна на эту машину (локальный клиент вытеснит клиента у соседа)."""
+    targets = [display] if display is not None else alive_sessions()
+    if not targets:
+        print("нет активных сессий на этой машине")
+        return
+    for n in targets:
+        log(f"возвращаю сессию :{n} на эту машину")
+        spawn_detached(attach_cmd(cfg, cfg["name"], n))
+
+
+def fit_to_screen(pid: int, timeout: float = 15) -> None:
+    """X11: окно, пришедшее с большого экрана, ужать до 85% нашего экрана и поставить по центру."""
+    if not shutil.which("xdotool"):
+        return
+    try:
+        sw, sh = map(int, run_out(["xdotool", "getdisplaygeometry"]).split())
+    except (WindriftError, ValueError, subprocess.TimeoutExpired):
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(pid)],
+                           capture_output=True, text=True)
+        wids = r.stdout.split()
+        if wids:
+            time.sleep(0.5)   # дать xpra выставить исходный размер
+            for wid in wids:
+                g = subprocess.run(["xdotool", "getwindowgeometry", "--shell", wid],
+                                   capture_output=True, text=True).stdout
+                geo = dict(line.split("=", 1) for line in g.split() if "=" in line)
+                w, h = int(geo.get("WIDTH", 0)), int(geo.get("HEIGHT", 0))
+                if w > sw * 0.95 or h > sh * 0.9:
+                    nw, nh = min(w, int(sw * 0.85)), min(h, int(sh * 0.85))
+                    subprocess.run(["xdotool", "windowsize", wid, str(nw), str(nh),
+                                    "windowmove", wid, str((sw - nw) // 2), str((sh - nh) // 2)],
+                                   capture_output=True)
+                    log(f"окно {wid}: {w}x{h} → {nw}x{nh} под экран {sw}x{sh}")
+            return
+        time.sleep(0.3)
+
+
 def cmd_stop(cfg: dict, display: int) -> None:
     subprocess.run(["xpra", "stop", f":{display}"], check=False)
     reg = registry_load()
@@ -551,7 +598,9 @@ async def handle(reader, writer, cfg: dict, clip: Clipboard | None) -> None:
         elif cmd == "attach":
             argv = attach_cmd(cfg, msg["owner"], int(msg["display"]))
             log(f"принимаю окно: {shlex.join(argv)}")
-            spawn_detached(argv)
+            pid = spawn_detached(argv)
+            if session_kind() == "x11":
+                threading.Thread(target=fit_to_screen, args=(pid,), daemon=True).start()
             reply = {"ok": True}
         elif cmd == "clip":
             if clip:
@@ -1066,6 +1115,8 @@ def main() -> None:
     sub.add_parser("send", help="отправить активное окно соседу")
     sub.add_parser("daemon", help="запустить демон")
     sub.add_parser("list", help="локальные сессии")
+    p_back = sub.add_parser("back", help="вернуть свои окна на эту машину")
+    p_back.add_argument("display", type=int, nargs="?", help="номер сессии (по умолчанию все)")
     p_stop = sub.add_parser("stop", help="остановить сессию")
     p_stop.add_argument("display", type=int)
     sub.add_parser("doctor", help="проверить окружение")
@@ -1080,6 +1131,7 @@ def main() -> None:
             case "send": cmd_send(load_config(a.config))
             case "daemon": asyncio.run(daemon(load_config(a.config)))
             case "list": cmd_list(load_config(a.config))
+            case "back": cmd_back(load_config(a.config), a.display)
             case "stop": cmd_stop(load_config(a.config), a.display)
             case "doctor": cmd_doctor(load_config(a.config))
     except (WindriftError, OSError, subprocess.CalledProcessError) as e:
