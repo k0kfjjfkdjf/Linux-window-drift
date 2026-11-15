@@ -20,6 +20,7 @@ sharing=no сам отключает старого клиента). Цепоч�
   windrift list                 показать локальные сессии
   windrift stop <N>             остановить сессию :N
   windrift doctor               проверить зависимости и связь с соседом
+  windrift mouse [stop]         общая мышь и клавиатура через Deskflow (сервер здесь, клиент у соседа)
 """
 from __future__ import annotations
 
@@ -59,6 +60,8 @@ DEFAULTS: dict = {
     "notify": True,
     "keep_proportions": True,
     "decorations": True,
+    "peer_side": "right",
+    "mouse_port": 24800,
     "clipboard": True,
     "clipboard_interval": 0.5,
     "clipboard_max_kb": 1024,
@@ -209,6 +212,13 @@ keep_proportions = {tv(c["keep_proportions"])}
 
 decorations = {tv(c["decorations"])}
 # X11: рисовать рамку с кнопками, даже если программа просила без неё
+
+# ── Общая мышь (windrift mouse, через Deskflow) ──────────────
+peer_side = {tv(c["peer_side"])}
+# с какой стороны от этого экрана стоит сосед: "right" | "left" | "up" | "down"
+
+mouse_port = {tv(c["mouse_port"])}
+# порт Deskflow
 
 # ── Буфер обмена ─────────────────────────────────────────────
 clipboard = {tv(c["clipboard"])}
@@ -753,7 +763,7 @@ def remote_bash(target: str, script: str, tty: bool = False, input_text: str | N
 
 # Выполняется у соседа: находит его графическую сессию, ставит автозапуск
 # демона и хоткей (Xfce), перезапускает демон с окружением этой сессии.
-PEER_DESKTOP_SCRIPT = r"""
+SESSION_ENV_SH = r"""
 pid=$(pgrep -u "$(id -u)" -x 'xfce4-session|plasmashell|ksmserver|Hyprland|sway|gnome-shell|lxqt-session|mate-session|cinnamon-session' | head -1)
 if [ -z "$pid" ]; then
   echo "графическая сессия не найдена — войди на рабочий стол и запусти: windrift daemon"
@@ -764,6 +774,9 @@ while IFS= read -r -d '' kv; do
 XDG_CURRENT_DESKTOP=*|HYPRLAND_INSTANCE_SIGNATURE=*|SWAYSOCK=*) export "$kv";; esac
 done < "/proc/$pid/environ"
 kind=нет; [ -n "$DISPLAY" ] && kind=x11; [ -n "$WAYLAND_DISPLAY" ] && kind=wayland
+"""
+
+PEER_DESKTOP_SCRIPT = SESSION_ENV_SH + r"""
 echo "рабочий стол: ${XDG_CURRENT_DESKTOP:-?}, сессия: $kind"
 bin="$HOME/.local/bin/windrift"
 case "$XDG_CURRENT_DESKTOP" in
@@ -922,6 +935,93 @@ chmod 600 "$f"
     print("\nГотово. На этой машине запусти демон и проверь:\n"
           "  windrift daemon          (и добавь его в автозапуск своего рабочего стола)\n"
           "  windrift doctor")
+
+
+# ───────────────────────── общая мышь (Deskflow) ─────────────────────────
+# Эта машина — сервер Deskflow (на ней физическая мышь), сосед — клиент.
+# TLS выключен: обе машины в доверенной локальной сети (см. README).
+
+OPPOSITE = {"right": "left", "left": "right", "up": "down", "down": "up"}
+
+PEER_MOUSE_SH = SESSION_ENV_SH + r"""
+pkill -u "$(id -u)" -f 'deskflow-(client|core client)' || true
+log="${XDG_RUNTIME_DIR:-/tmp}/windrift/deskflow-client.log"; mkdir -p "$(dirname "$log")"
+[ "$1" = stop ] && { echo "клиент Deskflow остановлен"; exit 0; }
+x11=(); [ "$kind" = x11 ] && x11=(--display "$DISPLAY")
+if command -v deskflow-client >/dev/null; then
+  setsid -f deskflow-client -f -1 -n "$NAME" "${x11[@]}" "$SERVER:$PORT" >"$log" 2>&1 </dev/null
+elif command -v deskflow-core >/dev/null; then
+  ini="$HOME/.config/windrift/deskflow-client.ini"; mkdir -p "$(dirname "$ini")"
+  printf '[core]\ncoreMode=1\ncomputerName=%s\nport=%s\n[client]\nremoteHost=%s\n[security]\ntlsEnabled=false\n' \
+    "$NAME" "$PORT" "$SERVER" > "$ini"
+  setsid -f deskflow-core client --new-instance -s "$ini" >"$log" 2>&1 </dev/null
+else
+  echo "у соседа нет Deskflow: sudo apt install deskflow" >&2; exit 1
+fi
+sleep 3
+if pgrep -u "$(id -u)" -f 'deskflow-(client|core client)' >/dev/null; then
+  echo "клиент Deskflow запущен как $NAME → $SERVER:$PORT"
+else
+  echo "клиент Deskflow не запустился:"
+fi
+tail -n 4 "$log"
+"""
+
+
+def cmd_mouse(cfg: dict, config_path: Path, action: str) -> None:
+    me, peer = cfg["name"], cfg["peer"]["name"]
+    side = cfg["peer_side"]
+    if side not in OPPOSITE:
+        raise WindriftError(f"peer_side должен быть одним из {', '.join(OPPOSITE)}")
+    port = int(cfg["mouse_port"])
+    local_re = r"deskflow-(server|core server)"
+    subprocess.run(["pkill", "-u", str(os.getuid()), "-f", local_re], capture_output=True)
+    remote_env = (f"NAME={shlex.quote(peer)} PORT={port} "
+                  f"SERVER={shlex.quote(local_ip_towards(cfg['peer']['host']))}")
+    if action == "stop":
+        subprocess.run(["ssh", cfg["peer"]["ssh"], f"env {remote_env} bash -s stop"],
+                       input=PEER_MOUSE_SH, text=True)
+        print("сервер Deskflow остановлен")
+        return
+    if subprocess.run(["pgrep", "-x", "deskflow"], capture_output=True).returncode == 0:
+        print("внимание: открыто окно Deskflow — закрой его, чтобы оно не мешало консольному серверу")
+
+    d = config_path.parent / "deskflow"
+    d.mkdir(parents=True, exist_ok=True)
+    screens = d / "screens.conf"
+    screens.write_text(
+        "section: screens\n"
+        f"\t{me}:\n\t{peer}:\n"
+        "end\n\n"
+        "section: links\n"
+        f"\t{me}:\n\t\t{side} = {peer}\n"
+        f"\t{peer}:\n\t\t{OPPOSITE[side]} = {me}\n"
+        "end\n")
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    log_path = RUNTIME / "deskflow-server.log"
+    if shutil.which("deskflow-core"):
+        ini = d / "server.ini"
+        ini.write_text(f"[core]\ncoreMode=2\ncomputerName={me}\nport={port}\n"
+                       f"[server]\nexternalConfig=true\nexternalConfigFile={screens}\nenableClipboard=true\n"
+                       "[security]\ntlsEnabled=false\n")
+        cmd = ["deskflow-core", "server", "--new-instance", "-s", str(ini)]
+    elif shutil.which("deskflow-server"):
+        cmd = ["deskflow-server", "-f", "-1", "-n", me, "-c", str(screens), "-a", f":{port}"]
+    else:
+        raise WindriftError("нет Deskflow: sudo pacman -S deskflow (или apt install deskflow)")
+    with open(log_path, "w") as logf:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True)
+    step(f"сервер Deskflow на {me} (сосед {peer} — {side}), порт {port}")
+    print("Hyprland может спросить разрешение на захват ввода — разреши.")
+    time.sleep(3)
+    print(log_path.read_text()[-800:] or "(лог пуст)")
+
+    step(f"клиент Deskflow на {peer}")
+    subprocess.run(["ssh", cfg["peer"]["ssh"], f"env {remote_env} bash -s start"],
+                   input=PEER_MOUSE_SH, text=True)
+    print(f"\nУведи курсор за {'правый' if side == 'right' else 'левый' if side == 'left' else 'верхний' if side == 'up' else 'нижний'}"
+          f" край экрана. Логи: {log_path} и {RUNTIME}/deskflow-client.log у соседа."
+          "\nОстановить: windrift mouse stop")
 
 
 # ───────────────────────── окно настроек ─────────────────────────
@@ -1185,6 +1285,8 @@ def main() -> None:
     p_stop = sub.add_parser("stop", help="остановить сессию")
     p_stop.add_argument("display", type=int)
     sub.add_parser("doctor", help="проверить окружение")
+    p_mouse = sub.add_parser("mouse", help="общая мышь через Deskflow: сервер здесь, клиент у соседа")
+    p_mouse.add_argument("action", nargs="?", default="start", choices=["start", "stop"])
     a = ap.parse_args()
 
     try:
@@ -1199,6 +1301,7 @@ def main() -> None:
             case "back": cmd_back(load_config(a.config), a.display)
             case "stop": cmd_stop(load_config(a.config), a.display)
             case "doctor": cmd_doctor(load_config(a.config))
+            case "mouse": cmd_mouse(load_config(a.config), a.config, a.action)
     except (WindriftError, OSError, subprocess.CalledProcessError) as e:
         notify(f"ошибка: {e}")
         sys.exit(1)

@@ -32,6 +32,13 @@ keep_proportions = true
 decorations = true
 # X11: рисовать рамку с кнопками, даже если программа просила без неё
 
+# ── Общая мышь (windrift mouse, через Deskflow) ──────────────
+peer_side = "right"
+# с какой стороны от этого экрана стоит сосед: "right" | "left" | "up" | "down"
+
+mouse_port = 24800
+# порт Deskflow
+
 # ── Буфер обмена ─────────────────────────────────────────────
 clipboard = true
 # синхронизировать текстовый буфер обмена с соседом
@@ -85,10 +92,10 @@ attach_args = []
 repo = "https://github.com/k0kfjjfkdjf/Linux-window-drift.git"
 dir = "~/Linux-window-drift"
 packages = ["git", "xpra", "wl-clipboard", "python", "openssh", "libnotify", "python-gobject", "gtk4"]
-# пакеты для соседа на Arch (pacman)
+# дополнительные пакеты для соседа на Arch (pacman); обязательные ставятся всегда
 
 packages_apt = ["git", "xpra", "xpra-x11", "python3", "xclip", "xdotool", "x11-utils", "wl-clipboard", "libnotify-bin", "openssh-server", "python3-gi", "gir1.2-gtk-4.0"]
-# пакеты для соседа на Debian/Ubuntu/Armbian (apt)
+# дополнительные пакеты для соседа на Debian/Ubuntu/Armbian (apt); обязательные ставятся всегда
 
 xpra_channel = "stable"
 # на Debian xpra ставится из репозитория xpra.org: "stable" | "lts" | "beta"
