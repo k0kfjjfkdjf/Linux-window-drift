@@ -263,10 +263,10 @@ attach_args = {tv(x["attach_args"])}
 repo = {tv(s["repo"])}
 dir = {tv(s["dir"])}
 packages = {tv(s["packages"])}
-# пакеты для соседа на Arch (pacman)
+# дополнительные пакеты для соседа на Arch (pacman); обязательные ставятся всегда
 
 packages_apt = {tv(s["packages_apt"])}
-# пакеты для соседа на Debian/Ubuntu/Armbian (apt)
+# дополнительные пакеты для соседа на Debian/Ubuntu/Armbian (apt); обязательные ставятся всегда
 
 xpra_channel = {tv(s["xpra_channel"])}
 # на Debian xpra ставится из репозитория xpra.org: "stable" | "lts" | "beta"
@@ -777,7 +777,10 @@ case "$XDG_CURRENT_DESKTOP" in
 esac
 case "$XDG_CURRENT_DESKTOP" in *XFCE*)
   key='/commands/custom/<Super><Shift>Right'
-  if xfconf-query -c xfce4-keyboard-shortcuts -p "$key" >/dev/null 2>&1; then
+  cur=$(xfconf-query -c xfce4-keyboard-shortcuts -p "$key" 2>/dev/null)
+  if [ "$cur" = "$bin send" ]; then
+    echo "хоткей: Super+Shift+→ = windrift send (уже назначен)"
+  elif [ -n "$cur" ]; then
     echo "хоткей Super+Shift+→ уже занят: $(xfconf-query -c xfce4-keyboard-shortcuts -p "$key") — назначь windrift send вручную"
   else
     xfconf-query -c xfce4-keyboard-shortcuts -p "$key" -n -t string -s "$bin send" \
@@ -819,6 +822,9 @@ def cmd_setup_peer(cfg: dict, target: str | None, peer_backend: str | None) -> N
     s = cfg["setup"]
     d = s["dir"].replace("~", "$HOME", 1)
     channel = {"stable": "", "lts": "-lts", "beta": "-beta"}.get(s["xpra_channel"], "")
+    # обязательные пакеты ставятся всегда; список из конфига только добавляет к ним свои
+    pkgs = list(dict.fromkeys(DEFAULTS["setup"]["packages"] + list(s["packages"])))
+    pkgs_apt = list(dict.fromkeys(DEFAULTS["setup"]["packages_apt"] + list(s["packages_apt"])))
     # Запасной путь до xpra.org: SOCKS-прокси у соседа на 127.0.0.1:port, который ssh -R
     # заворачивает через эту машину. Помогает, если у соседа xpra.org режется провайдером.
     sport = 20000 + secrets.randbelow(30000)
@@ -826,7 +832,7 @@ def cmd_setup_peer(cfg: dict, target: str | None, peer_backend: str | None) -> N
     remote_bash(target, f"""set -e
 if command -v pacman >/dev/null; then
   echo "сосед: Arch (pacman)"
-  sudo pacman -S --needed {" ".join(shlex.quote(p) for p in s["packages"])}
+  sudo pacman -S --needed {" ".join(shlex.quote(p) for p in pkgs)}
 elif command -v apt-get >/dev/null; then
   . /etc/os-release
   codename="${{VERSION_CODENAME:-$(lsb_release -cs 2>/dev/null)}}"
@@ -846,7 +852,7 @@ elif command -v apt-get >/dev/null; then
   fi
   apt-cache policy xpra 2>/dev/null | grep -q xpra.org || {{
     echo "xpra.org недоступен и через эту машину — проверь: curl -I https://xpra.org/dists/" >&2; exit 1; }}
-  sudo apt-get install -y {via_me} {" ".join(shlex.quote(p) for p in s["packages_apt"])}
+  sudo apt-get install -y {via_me} {" ".join(shlex.quote(p) for p in pkgs_apt)}
 else
   echo "неизвестный пакетный менеджер — поставь xpra, git, python3 вручную" >&2; exit 1
 fi
