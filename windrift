@@ -339,7 +339,8 @@ def attach_cmd(cfg: dict, owner: str, display: int) -> list[str]:
     else:
         raise WindriftError(f"неизвестный владелец '{owner}'")
     x = cfg["xpra"]
-    opts = ["--tray=no", "--splash=no", "--reconnect=no", *media_opts(cfg)]
+    # буфер обмена синхронизирует windrift; у xpra он только мешает (таймауты, BadWindow)
+    opts = ["--tray=no", "--splash=no", "--reconnect=no", "--clipboard=no", *media_opts(cfg)]
     if x["encoding"] != "auto":
         opts.append(f"--encoding={x['encoding']}")
     if int(x["quality"]) > 0:
@@ -363,6 +364,7 @@ def cmd_run(cfg: dict, argv: list[str]) -> None:
         "--attach=no",
         "--daemon=yes",
         "--tray=no",
+        "--clipboard=no",
         *media_opts(cfg),
         *[f"--env={k}={v}" for k, v in X11_ENV.items()],
         *cfg["xpra"]["server_args"],
@@ -548,7 +550,7 @@ def mirror_start(xid: int) -> int:
     spec = f":{display},geometry=" + "/".join(f"{w}x{h}@{x}x{y}" for x, y, w, h in geoms)
     cmd = ["xpra", "shadow", spec, "--daemon=yes", "--attach=no", "--sharing=no",
            "--tray=no", "--notifications=no", "--mdns=no", "--printing=no", "--webcam=no",
-           "--splash=no", *media_opts_mirror()]
+           "--splash=no", "--clipboard=no", *media_opts_mirror()]
     log(f"зеркало: {shlex.join(cmd)}")
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
