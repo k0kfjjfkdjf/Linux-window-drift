@@ -44,7 +44,8 @@ from pathlib import Path
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "windrift" / "config.toml"
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/windrift-{os.getuid()}")) / "windrift"
 REPO_URL = "https://github.com/k0kfjjfkdjf/Linux-window-drift.git"
-BACKENDS = ["hyprland", "kde", "sway"]
+BACKENDS = ["auto", "hyprland", "kde", "sway", "x11"]
+BACKEND_TOOL = {"hyprland": "hyprctl", "kde": "kdotool", "sway": "swaymsg", "x11": "xdotool"}
 ENCODINGS = ["auto", "rgb", "png", "jpeg", "webp", "h264", "vp8", "vp9"]
 
 # Все настройки и их значения по умолчанию. Конфиг накладывается поверх.
@@ -53,7 +54,7 @@ DEFAULTS: dict = {
     "token": "",
     "port": 7781,
     "listen": "0.0.0.0",
-    "backend": "hyprland",
+    "backend": "auto",
     "notify": True,
     "clipboard": True,
     "clipboard_interval": 0.5,
@@ -73,6 +74,9 @@ DEFAULTS: dict = {
         "dir": "~/Linux-window-drift",
         "packages": ["git", "xpra", "wl-clipboard", "python", "openssh", "libnotify",
                      "python-gobject", "gtk4"],
+        "packages_apt": ["git", "xpra", "python3", "xclip", "xdotool", "wl-clipboard",
+                         "libnotify-bin", "openssh-server", "python3-gi", "gir1.2-gtk-4.0"],
+        "xpra_channel": "stable",
     },
 }
 
@@ -189,7 +193,8 @@ listen = {tv(c["listen"])}
 # лучше указать IP в локальной сети или WireGuard-интерфейса
 
 backend = {tv(c["backend"])}
-# как узнать активное окно: "hyprland" | "kde" (нужен kdotool) | "sway"
+# как узнать активное окно: "auto" (определить самому) | "hyprland" | "kde" (нужен kdotool)
+# | "sway" | "x11" (Xfce и другие X11-столы, нужен xdotool)
 
 notify = {tv(c["notify"])}
 # показывать ошибки через notify-send
@@ -247,6 +252,13 @@ attach_args = {tv(x["attach_args"])}
 repo = {tv(s["repo"])}
 dir = {tv(s["dir"])}
 packages = {tv(s["packages"])}
+# пакеты для соседа на Arch (pacman)
+
+packages_apt = {tv(s["packages_apt"])}
+# пакеты для соседа на Debian/Ubuntu/Armbian (apt)
+
+xpra_channel = {tv(s["xpra_channel"])}
+# на Debian xpra ставится из репозитория xpra.org: "stable" | "lts" | "beta"
 """
 
 
@@ -363,7 +375,35 @@ def cmd_stop(cfg: dict, display: int) -> None:
 
 # ───────────────────────── бэкенды композиторов ─────────────────────────
 
+def session_kind() -> str:
+    """wayland | x11 | none — куда показывать окна и откуда брать буфер обмена."""
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if os.environ.get("DISPLAY"):
+        return "x11"
+    return "none"
+
+
+def resolve_backend(backend: str) -> str:
+    if backend != "auto":
+        return backend
+    env = os.environ
+    desktop = env.get("XDG_CURRENT_DESKTOP", "").lower()
+    if env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "hyprland"
+    if env.get("SWAYSOCK"):
+        return "sway"
+    if session_kind() == "wayland" and "kde" in desktop:
+        return "kde"
+    if session_kind() == "x11":
+        return "x11"
+    raise WindriftError("не удалось определить рабочий стол — укажи backend в конфиге")
+
+
 def focused_pid(backend: str) -> int:
+    backend = resolve_backend(backend)
+    if backend == "x11":
+        return int(run_out(["xdotool", "getactivewindow", "getwindowpid"]).strip())
     if backend == "hyprland":
         return int(json.loads(run_out(["hyprctl", "activewindow", "-j"]))["pid"])
     if backend == "kde":
@@ -444,10 +484,21 @@ def cmd_send(cfg: dict) -> None:
 # ───────────────────────── буфер обмена ─────────────────────────
 
 class Clipboard:
-    """Синхронизация текста через wl-paste/wl-copy (опрос)."""
+    """Синхронизация текста: wl-paste/wl-copy в Wayland, xclip в X11 (опрос)."""
+
+    TOOLS = {
+        "wayland": (["wl-paste", "--no-newline", "--type", "text"], ["wl-copy"]),
+        "x11": (["xclip", "-o", "-selection", "clipboard"], ["xclip", "-i", "-selection", "clipboard"]),
+    }
+
+    @classmethod
+    def available(cls) -> bool:
+        tools = cls.TOOLS.get(session_kind())
+        return bool(tools) and all(shutil.which(t[0]) for t in tools)
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        self.read_cmd, self.write_cmd = self.TOOLS[session_kind()]
         self.interval = float(cfg["clipboard_interval"])
         self.max_bytes = int(cfg["clipboard_max_kb"]) * 1024
         self.last = self._hash(self._read())
@@ -456,11 +507,9 @@ class Clipboard:
     def _hash(data: bytes | None) -> str | None:
         return hashlib.sha256(data).hexdigest() if data is not None else None
 
-    @staticmethod
-    def _read() -> bytes | None:
+    def _read(self) -> bytes | None:
         try:
-            r = subprocess.run(["wl-paste", "--no-newline", "--type", "text"],
-                               capture_output=True, timeout=2)
+            r = subprocess.run(self.read_cmd, capture_output=True, timeout=2)
         except subprocess.TimeoutExpired:
             return None
         return r.stdout if r.returncode == 0 else None
@@ -468,7 +517,9 @@ class Clipboard:
     def set_from_peer(self, text: str) -> None:
         data = text.encode()
         self.last = self._hash(data)   # не отправлять обратно → нет пинг-понга
-        subprocess.run(["wl-copy"], input=data, timeout=2, check=False)
+        # xclip/wl-copy уходят в фон и держат буфер; их вывод нам не нужен
+        subprocess.run(self.write_cmd, input=data, timeout=2, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     async def loop(self) -> None:
         while True:
@@ -517,9 +568,11 @@ async def handle(reader, writer, cfg: dict, clip: Clipboard | None) -> None:
 
 
 async def daemon(cfg: dict) -> None:
-    if not os.environ.get("WAYLAND_DISPLAY"):
-        log("внимание: WAYLAND_DISPLAY не задан — принятые окна некуда будет показать")
-    clip = Clipboard(cfg) if cfg["clipboard"] and shutil.which("wl-paste") else None
+    if session_kind() == "none":
+        log("внимание: нет ни WAYLAND_DISPLAY, ни DISPLAY — принятые окна некуда будет показать")
+    clip = Clipboard(cfg) if cfg["clipboard"] and Clipboard.available() else None
+    if cfg["clipboard"] and not clip:
+        log("буфер обмена выключен: нет wl-paste/wl-copy (Wayland) или xclip (X11)")
     server = await asyncio.start_server(lambda r, w: handle(r, w, cfg, clip),
                                         cfg["listen"], cfg["port"])
     log(f"демон '{cfg['name']}' слушает {cfg['listen']}:{cfg['port']}, буфер обмена: {'да' if clip else 'нет'}")
@@ -532,8 +585,15 @@ async def daemon(cfg: dict) -> None:
 # ───────────────────────── doctor ─────────────────────────
 
 def cmd_doctor(cfg: dict) -> None:
-    need = {"xpra": True, "ssh": True, "wl-paste": cfg["clipboard"], "wl-copy": cfg["clipboard"],
-            {"hyprland": "hyprctl", "kde": "kdotool", "sway": "swaymsg"}.get(cfg["backend"], "?"): True}
+    kind = session_kind()
+    try:
+        backend = resolve_backend(cfg["backend"])
+    except WindriftError:
+        backend = "?"
+    print(f"сессия: {kind}, backend: {backend}")
+    clip_tools = {"wayland": ["wl-paste", "wl-copy"], "x11": ["xclip"]}.get(kind, [])
+    need = {"xpra": True, "ssh": True, BACKEND_TOOL.get(backend, "?"): True,
+            **{t: cfg["clipboard"] for t in clip_tools}}
     ok = True
     for tool, required in need.items():
         if required:
@@ -585,6 +645,49 @@ def remote_bash(target: str, script: str, tty: bool = False, input_text: str | N
                           capture_output=capture)
 
 
+
+# Выполняется у соседа: находит его графическую сессию, ставит автозапуск
+# демона и хоткей (Xfce), перезапускает демон с окружением этой сессии.
+PEER_DESKTOP_SCRIPT = r"""
+pid=$(pgrep -u "$(id -u)" -x 'xfce4-session|plasmashell|ksmserver|Hyprland|sway|gnome-shell|lxqt-session|mate-session|cinnamon-session' | head -1)
+if [ -z "$pid" ]; then
+  echo "графическая сессия не найдена — войди на рабочий стол и запусти: windrift daemon"
+  exit 0
+fi
+while IFS= read -r -d '' kv; do
+  case "$kv" in DISPLAY=*|WAYLAND_DISPLAY=*|XAUTHORITY=*|DBUS_SESSION_BUS_ADDRESS=*|XDG_RUNTIME_DIR=*|\
+XDG_CURRENT_DESKTOP=*|HYPRLAND_INSTANCE_SIGNATURE=*|SWAYSOCK=*) export "$kv";; esac
+done < "/proc/$pid/environ"
+kind=нет; [ -n "$DISPLAY" ] && kind=x11; [ -n "$WAYLAND_DISPLAY" ] && kind=wayland
+echo "рабочий стол: ${XDG_CURRENT_DESKTOP:-?}, сессия: $kind"
+bin="$HOME/.local/bin/windrift"
+case "$XDG_CURRENT_DESKTOP" in
+  *Hyprland*|*sway*)
+    echo "добавь в конфиг композитора: exec-once = $bin daemon и хоткей на: $bin send" ;;
+  *)
+    mkdir -p ~/.config/autostart
+    printf '[Desktop Entry]\nType=Application\nName=windrift daemon\nExec=%s daemon\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n' "$bin" \
+      > ~/.config/autostart/windrift.desktop
+    echo "автозапуск демона: ~/.config/autostart/windrift.desktop" ;;
+esac
+case "$XDG_CURRENT_DESKTOP" in *XFCE*)
+  key='/commands/custom/<Super><Shift>Right'
+  if xfconf-query -c xfce4-keyboard-shortcuts -p "$key" >/dev/null 2>&1; then
+    echo "хоткей Super+Shift+→ уже занят: $(xfconf-query -c xfce4-keyboard-shortcuts -p "$key") — назначь windrift send вручную"
+  else
+    xfconf-query -c xfce4-keyboard-shortcuts -p "$key" -n -t string -s "$bin send" \
+      && echo "хоткей: Super+Shift+→ = windrift send"
+  fi ;;
+esac
+pkill -u "$(id -u)" -f '^python3[^ ]* [^ ]*/windrift daemon' || true
+mkdir -p "${XDG_RUNTIME_DIR:-/tmp}/windrift"
+setsid -f "$bin" daemon >>"${XDG_RUNTIME_DIR:-/tmp}/windrift/daemon.log" 2>&1 </dev/null
+sleep 1
+pgrep -u "$(id -u)" -f '^python3[^ ]* [^ ]*/windrift daemon' >/dev/null \
+  && echo "демон запущен (лог: ${XDG_RUNTIME_DIR:-/tmp}/windrift/daemon.log)" \
+  || { echo "демон не запустился:"; tail -5 "${XDG_RUNTIME_DIR:-/tmp}/windrift/daemon.log"; }
+"""
+
 def cmd_setup_peer(cfg: dict, target: str | None, peer_backend: str | None) -> None:
     target = target or cfg["peer"]["ssh"]
     if not target:
@@ -598,7 +701,7 @@ def cmd_setup_peer(cfg: dict, target: str | None, peer_backend: str | None) -> N
         cfg["peer"]["host"] = ssh_hostname(target)
     save_config(cfg)
 
-    step(f"1/5 ssh-ключ: эта машина → {target}")
+    step(f"1/6 ssh-ключ: эта машина → {target}")
     if ssh_ok(target):
         print("уже настроен")
     else:
@@ -607,18 +710,41 @@ def cmd_setup_peer(cfg: dict, target: str | None, peer_backend: str | None) -> N
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
         subprocess.run(["ssh-copy-id", target], check=True)
 
-    step("2/5 пакеты и windrift на соседе (может спросить пароль sudo)")
+    step("2/6 пакеты и windrift на соседе (может спросить пароль sudo)")
     s = cfg["setup"]
     d = s["dir"].replace("~", "$HOME", 1)
+    channel = {"stable": "", "lts": "-lts", "beta": "-beta"}.get(s["xpra_channel"], "")
     remote_bash(target, f"""set -e
-sudo pacman -S --needed {" ".join(shlex.quote(p) for p in s["packages"])}
-sudo systemctl enable --now sshd
-if [ -d "{d}/.git" ]; then git -C "{d}" pull --ff-only; else git clone {shlex.quote(s["repo"])} "{d}"; fi
+if command -v pacman >/dev/null; then
+  echo "сосед: Arch (pacman)"
+  sudo pacman -S --needed {" ".join(shlex.quote(p) for p in s["packages"])}
+elif command -v apt-get >/dev/null; then
+  . /etc/os-release
+  codename="${{VERSION_CODENAME:-$(lsb_release -cs 2>/dev/null)}}"
+  echo "сосед: $PRETTY_NAME ($codename, $(dpkg --print-architecture))"
+  if [ ! -f /etc/apt/sources.list.d/xpra.sources ]; then
+    echo "подключаю репозиторий xpra.org (в Debian xpra слишком старый)"
+    sudo apt-get update -q
+    sudo apt-get install -y -q ca-certificates wget
+    sudo wget -qO /usr/share/keyrings/xpra.asc https://xpra.org/xpra.asc
+    sudo wget -qO /etc/apt/sources.list.d/xpra.sources \\
+      "https://raw.githubusercontent.com/Xpra-org/xpra/master/packaging/repos/$codename/xpra{channel}.sources"
+  fi
+  sudo apt-get update -q
+  sudo apt-get install -y {" ".join(shlex.quote(p) for p in s["packages_apt"])}
+else
+  echo "неизвестный пакетный менеджер — поставь xpra, git, python3 вручную" >&2; exit 1
+fi
+systemctl is-active -q sshd 2>/dev/null || systemctl is-active -q ssh 2>/dev/null \\
+  || sudo systemctl enable --now sshd 2>/dev/null || sudo systemctl enable --now ssh
+echo "xpra у соседа: $(xpra --version 2>/dev/null | head -1)"
+if [ -d "{d}/.git" ]; then git -C "{d}" fetch -q origin && git -C "{d}" reset -q --hard FETCH_HEAD
+else git clone -q {shlex.quote(s["repo"])} "{d}"; fi
 install -Dm755 "{d}/windrift" "$HOME/.local/bin/windrift"
 install -Dm644 "{d}/windrift-settings.desktop" "$HOME/.local/share/applications/windrift-settings.desktop" || true
 """, tty=True)
 
-    step(f"3/5 ssh-ключ: {target} → эта машина")
+    step(f"3/6 ssh-ключ: {target} → эта машина")
     pub = remote_bash(target, """set -e
 [ -f ~/.ssh/id_ed25519.pub ] || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
 cat ~/.ssh/id_ed25519.pub
@@ -637,14 +763,19 @@ cat ~/.ssh/id_ed25519.pub
     if subprocess.run(["systemctl", "is-active", "--quiet", "sshd"]).returncode != 0:
         print("здесь не запущен sshd — включаю (может спросить пароль sudo)")
         subprocess.run(["sudo", "systemctl", "enable", "--now", "sshd"], check=False)
-
-    step("4/5 зеркальный конфиг на соседе")
     my_ip = local_ip_towards(cfg["peer"]["host"])
+    me = f"{getpass.getuser()}@{my_ip}"
+    # заранее принимаем ключ хоста, иначе xpra attach у соседа зависнет на вопросе yes/no
+    r = remote_bash(target, f"ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "
+                            f"-o ConnectTimeout=5 {me} true && echo ok || echo fail", capture=True)
+    back = r.stdout.strip().endswith("ok")
+    print(f"{'✓' if back else '✗'} ssh обратно с соседа на {me}")
+
+    step("4/6 зеркальный конфиг на соседе")
     pcfg = copy.deepcopy(cfg)
     pcfg["name"] = cfg["peer"]["name"]
-    pcfg["backend"] = peer_backend or cfg["backend"]
-    pcfg["peer"] = {"name": cfg["name"], "host": my_ip, "port": cfg["port"],
-                    "ssh": f"{getpass.getuser()}@{my_ip}"}
+    pcfg["backend"] = peer_backend or "auto"
+    pcfg["peer"] = {"name": cfg["name"], "host": my_ip, "port": cfg["port"], "ssh": me}
     remote_bash(target, """set -e
 mkdir -p ~/.config/windrift
 f=~/.config/windrift/config.toml
@@ -652,19 +783,23 @@ f=~/.config/windrift/config.toml
 cat > "$f"
 chmod 600 "$f"
 """, input_text=render_config(pcfg))
-    print(f"name={pcfg['name']}, backend={pcfg['backend']}, peer={my_ip}")
+    print(f"name={pcfg['name']}, backend={pcfg['backend']}, peer={me}")
 
-    step("5/5 проверка")
-    ok = ssh_ok(target)
-    print(f"{'✓' if ok else '✗'} ssh {target}")
-    r = remote_bash(target, f"ssh -o BatchMode=yes -o ConnectTimeout=5 {getpass.getuser()}@{my_ip} true "
-                            "&& echo ok || echo fail", capture=True)
-    back = r.stdout.strip().endswith("ok")
-    print(f"{'✓' if back else '✗'} ssh обратно с соседа на {my_ip}")
-    print("\nГотово. Осталось запустить демон на обеих машинах:\n"
-          "  Hyprland: exec-once = windrift daemon   (в hyprland.conf)\n"
-          "  KDE: Автозапуск → windrift daemon\n"
-          "и проверить: windrift doctor")
+    step("5/6 рабочий стол соседа: автозапуск, хоткей, демон")
+    remote_bash(target, PEER_DESKTOP_SCRIPT)
+
+    step("6/6 проверка")
+    print(f"{'✓' if ssh_ok(target) else '✗'} ssh {target}")
+    print(f"{'✓' if back else '✗'} ssh обратно на {me}")
+    time.sleep(1)
+    try:
+        r = send_peer(cfg, {"cmd": "ping"}, timeout=3)
+        print(f"✓ демон соседа отвечает: {r.get('name')}" if r.get("ok") else f"✗ сосед: {r.get('error')}")
+    except (OSError, WindriftError) as e:
+        print(f"✗ демон соседа не отвечает: {e}")
+    print("\nГотово. На этой машине запусти демон и проверь:\n"
+          "  windrift daemon          (Hyprland: exec-once = windrift daemon в hyprland.conf)\n"
+          "  windrift doctor")
 
 
 # ───────────────────────── окно настроек ─────────────────────────
@@ -795,7 +930,7 @@ def cmd_settings(path: Path) -> None:
             tok.append(w)
         add("Токен", tok, "общий секрет, одинаковый на обеих машинах")
         readers["token"] = lambda: tok_entry.get_text().strip()
-        dropdown("backend", "Композитор", BACKENDS, "как узнать активное окно")
+        dropdown("backend", "Рабочий стол", BACKENDS, "как узнать активное окно; auto — определить самому")
         spin("port", "Порт демона", 1, 65535, 1)
         entry("listen", "Слушать адрес", "0.0.0.0 — все интерфейсы")
         switch("notify", "Уведомления об ошибках")
@@ -823,7 +958,9 @@ def cmd_settings(path: Path) -> None:
         section("Установка на соседа")
         entry("setup.repo", "Репозиторий")
         entry("setup.dir", "Папка у соседа")
-        list_entry("setup.packages", "Пакеты")
+        list_entry("setup.packages", "Пакеты (Arch)")
+        list_entry("setup.packages_apt", "Пакеты (Debian)")
+        dropdown("setup.xpra_channel", "Канал xpra (Debian)", ["stable", "lts", "beta"])
 
         status = Gtk.Label(xalign=0, wrap=True, selectable=True)
         outer.append(status)
@@ -911,7 +1048,7 @@ def main() -> None:
     sub.add_parser("settings", help="окно настроек")
     p_setup = sub.add_parser("setup-peer", help="установить и настроить windrift на соседе по SSH")
     p_setup.add_argument("ssh", nargs="?", help="user@host или ssh-алиас (по умолчанию peer.ssh)")
-    p_setup.add_argument("--backend", choices=BACKENDS, help="композитор соседа (по умолчанию как здесь)")
+    p_setup.add_argument("--backend", choices=BACKENDS, help="backend соседа (по умолчанию auto)")
     p_run = sub.add_parser("run", help="запустить программу в переносимой сессии")
     p_run.add_argument("argv", nargs=argparse.REMAINDER)
     sub.add_parser("send", help="отправить активное окно соседу")

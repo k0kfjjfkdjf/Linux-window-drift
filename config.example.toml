@@ -17,8 +17,9 @@ listen = "0.0.0.0"
 # на каком адресе слушает демон: "0.0.0.0" — все интерфейсы,
 # лучше указать IP в локальной сети или WireGuard-интерфейса
 
-backend = "hyprland"
-# как узнать активное окно: "hyprland" | "kde" (нужен kdotool) | "sway"
+backend = "auto"
+# как узнать активное окно: "auto" (определить самому) | "hyprland" | "kde" (нужен kdotool)
+# | "sway" | "x11" (Xfce и другие X11-столы, нужен xdotool)
 
 notify = true
 # показывать ошибки через notify-send
@@ -76,3 +77,10 @@ attach_args = []
 repo = "https://github.com/k0kfjjfkdjf/Linux-window-drift.git"
 dir = "~/Linux-window-drift"
 packages = ["git", "xpra", "wl-clipboard", "python", "openssh", "libnotify", "python-gobject", "gtk4"]
+# пакеты для соседа на Arch (pacman)
+
+packages_apt = ["git", "xpra", "python3", "xclip", "xdotool", "wl-clipboard", "libnotify-bin", "openssh-server", "python3-gi", "gir1.2-gtk-4.0"]
+# пакеты для соседа на Debian/Ubuntu/Armbian (apt)
+
+xpra_channel = "stable"
+# на Debian xpra ставится из репозитория xpra.org: "stable" | "lts" | "beta"
