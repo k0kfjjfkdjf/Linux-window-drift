@@ -54,3 +54,47 @@ index dc1d525..b5dc1d8 100644
                  }
                  app.ungrab();
              }
+diff --git a/input-emulation/src/wlroots.rs b/input-emulation/src/wlroots.rs
+index d332f99..4a196ca 100644
+--- a/input-emulation/src/wlroots.rs
++++ b/input-emulation/src/wlroots.rs
+@@ -40,6 +40,10 @@ struct State {
+     /// shared by all clients, so the keymap fd is sent once instead of once per client
+     keyboard: Option<Vk>,
+     input_for_client: HashMap<EmulationHandle, VirtualInput>,
++    /// virtual pointers of disconnected clients, reused instead of destroyed:
++    /// removing an input device makes Hyprland refocus the pointer, which breaks
++    /// a pointer lock this machine has just taken (capture bounces back)
++    spare_pointers: Vec<Vp>,
+     seat: wl_seat::WlSeat,
+     qh: QueueHandle<Self>,
+     vpm: VpManager,
+@@ -78,6 +82,7 @@ impl WlrootsEmulation {
+                 keymap: None,
+                 keyboard: None,
+                 input_for_client,
++                spare_pointers: Vec::new(),
+                 seat,
+                 vpm,
+                 vkm,
+@@ -97,7 +102,10 @@ impl WlrootsEmulation {
+ 
+ impl State {
+     fn add_client(&mut self, client: EmulationHandle) {
+-        let pointer: Vp = self.vpm.create_virtual_pointer(None, &self.qh, ());
++        let pointer: Vp = match self.spare_pointers.pop() {
++            Some(p) => p,
++            None => self.vpm.create_virtual_pointer(None, &self.qh, ()),
++        };
+ 
+         let keyboard = match self.keyboard.as_ref() {
+             Some(keyboard) => keyboard.clone(),
+@@ -125,7 +133,7 @@ impl State {
+     fn destroy_client(&mut self, handle: EmulationHandle) {
+         // the shared keyboard outlives every client; keys are released by InputEmulation::destroy
+         if let Some(input) = self.input_for_client.remove(&handle) {
+-            input.pointer.destroy();
++            self.spare_pointers.push(input.pointer);
+         }
+     }
+ }
