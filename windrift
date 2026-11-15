@@ -638,9 +638,10 @@ def local_ip_towards(host: str) -> str:
 
 
 def remote_bash(target: str, script: str, tty: bool = False, input_text: str | None = None,
-                capture: bool = False) -> subprocess.CompletedProcess:
+                capture: bool = False, socks_port: int | None = None) -> subprocess.CompletedProcess:
     # оборачиваем в bash -c: у соседа login shell может быть fish
-    cmd = ["ssh", *(["-t"] if tty else []), target, "bash -c " + shlex.quote(script)]
+    fwd = ["-o", "ExitOnForwardFailure=yes", "-R", f"127.0.0.1:{socks_port}"] if socks_port else []
+    cmd = ["ssh", *(["-t"] if tty else []), *fwd, target, "bash -c " + shlex.quote(script)]
     return subprocess.run(cmd, input=input_text, text=True, check=True,
                           capture_output=capture)
 
@@ -714,6 +715,10 @@ def cmd_setup_peer(cfg: dict, target: str | None, peer_backend: str | None) -> N
     s = cfg["setup"]
     d = s["dir"].replace("~", "$HOME", 1)
     channel = {"stable": "", "lts": "-lts", "beta": "-beta"}.get(s["xpra_channel"], "")
+    # Запасной путь до xpra.org: SOCKS-прокси у соседа на 127.0.0.1:port, который ssh -R
+    # заворачивает через эту машину. Помогает, если у соседа xpra.org режется провайдером.
+    sport = 20000 + secrets.randbelow(30000)
+    via_me = f"-o Acquire::https::Proxy::xpra.org=socks5h://127.0.0.1:{sport}"
     remote_bash(target, f"""set -e
 if command -v pacman >/dev/null; then
   echo "сосед: Arch (pacman)"
@@ -730,8 +735,14 @@ elif command -v apt-get >/dev/null; then
     sudo wget -qO /etc/apt/sources.list.d/xpra.sources \\
       "https://raw.githubusercontent.com/Xpra-org/xpra/master/packaging/repos/$codename/xpra{channel}.sources"
   fi
-  sudo apt-get update -q
-  sudo apt-get install -y {" ".join(shlex.quote(p) for p in s["packages_apt"])}
+  sudo apt-get update -q || true
+  if ! apt-cache policy xpra 2>/dev/null | grep -q xpra.org; then
+    echo "xpra.org напрямую недоступен — качаю через туннель на {getpass.getuser()}@эту машину"
+    sudo apt-get update -q {via_me} || true
+  fi
+  apt-cache policy xpra 2>/dev/null | grep -q xpra.org || {{
+    echo "xpra.org недоступен и через эту машину — проверь: curl -I https://xpra.org/dists/" >&2; exit 1; }}
+  sudo apt-get install -y {via_me} {" ".join(shlex.quote(p) for p in s["packages_apt"])}
 else
   echo "неизвестный пакетный менеджер — поставь xpra, git, python3 вручную" >&2; exit 1
 fi
@@ -743,7 +754,7 @@ else git clone -q {shlex.quote(s["repo"])} "{d}"; fi
 install -Dm755 "{d}/windrift" "$HOME/.local/bin/windrift"
 mkdir -p "$HOME/.local/share/applications"
 sed "s|^Exec=windrift|Exec=$HOME/.local/bin/windrift|" "{d}/windrift-settings.desktop" > "$HOME/.local/share/applications/windrift-settings.desktop" || true
-""", tty=True)
+""", tty=True, socks_port=sport)
 
     step(f"3/6 ssh-ключ: {target} → эта машина")
     pub = remote_bash(target, """set -e
