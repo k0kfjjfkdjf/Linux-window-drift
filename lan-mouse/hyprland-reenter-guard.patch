@@ -1,5 +1,5 @@
 diff --git a/input-capture/src/layer_shell.rs b/input-capture/src/layer_shell.rs
-index dc1d525..b5dc1d8 100644
+index dc1d525..7860597 100644
 --- a/input-capture/src/layer_shell.rs
 +++ b/input-capture/src/layer_shell.rs
 @@ -117,6 +117,10 @@ struct State {
@@ -21,20 +21,24 @@ index dc1d525..b5dc1d8 100644
              rel_pointer: None,
              shortcut_inhibitor: None,
              active_windows: Vec::new(),
-@@ -475,6 +480,7 @@ impl State {
+@@ -475,6 +480,11 @@ impl State {
      }
  
      fn ungrab(&mut self) {
-+        self.released_at = Some(std::time::Instant::now());
++        // only a real release arms the re-enter guard; a plain `leave` must not,
++        // or a fast flick that brushes the edge strip gets ignored
++        if self.pointer_lock.is_some() {
++            self.released_at = Some(std::time::Instant::now());
++        }
          // get focused client
          let window = match self.focused.as_ref() {
              Some(focused) => focused,
-@@ -724,6 +730,15 @@ impl Dispatch<WlPointer, ()> for State {
+@@ -724,6 +734,15 @@ impl Dispatch<WlPointer, ()> for State {
                  surface_x: _,
                  surface_y: _,
              } => {
 +                // ignore a re-enter right after a release (see `released_at`)
-+                const REENTER_GUARD: std::time::Duration = std::time::Duration::from_millis(300);
++                const REENTER_GUARD: std::time::Duration = std::time::Duration::from_millis(150);
 +                if let Some(t) = app.released_at {
 +                    if t.elapsed() < REENTER_GUARD {
 +                        log::info!("ignoring pointer enter {:?} after release", t.elapsed());
@@ -45,7 +49,7 @@ index dc1d525..b5dc1d8 100644
                  // get client corresponding to the focused surface
                  {
                      if let Some(window) = app.active_windows.iter().find(|w| w.surface == surface) {
-@@ -751,6 +766,8 @@ impl Dispatch<WlPointer, ()> for State {
+@@ -751,6 +770,8 @@ impl Dispatch<WlPointer, ()> for State {
                   */
                  if app.pointer_lock.is_some() {
                      log::warn!("compositor released mouse");

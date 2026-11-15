@@ -24,7 +24,7 @@ cargo build --release --no-default-features --features x11_capture,x11_emulation
 `hyprland-reenter-guard.patch` (только для Wayland-сборки): Hyprland после снятия
 захвата иногда сразу снова присылает `wl_pointer.enter` для полоски у края, и lan-mouse
 тут же захватывает мышь обратно, а через секунду Hyprland отбирает захват
-(`compositor released mouse`). Патч игнорирует вход в полоску в первые 300 мс после
+(`compositor released mouse`). Патч игнорирует вход в полоску в первые 150 мс после настоящего
 возврата и пишет в лог входы/выходы курсора для диагностики.
 
 Главная причина оказалась в эмуляции: при каждом выходе соседа lan-mouse уничтожал
