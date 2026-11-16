@@ -20,6 +20,7 @@ sharing=no сам отключает старого клиента). Цепоч�
   windrift list                 показать локальные сессии
   windrift stop <N>             остановить сессию :N
   windrift up | down | status   запустить / остановить / показать всё на обеих машинах
+  windrift update               обновить windrift из git на обеих машинах и перезапустить
   windrift doctor               проверить зависимости и связь с соседом
   windrift mouse [stop|setup]   общая мышь и клавиатура в обе стороны (lan-mouse; setup — собрать и настроить)
 """
@@ -159,6 +160,7 @@ def load_config(path: Path = CONFIG_PATH, strict: bool = True) -> dict:
     elif strict:
         raise WindriftError(f"нет конфига {path} — создай его: `windrift init` или `windrift settings`")
     cfg = merge(DEFAULTS, over)
+    cfg["_path"] = str(path)   # чтобы дочерние процессы (stream, view) читали тот же конфиг
     if strict:
         missing = [k for k in ("name", "token") if not cfg[k]]
         missing += [f"peer.{k}" for k in ("name", "host", "ssh") if not cfg["peer"][k]]
@@ -472,7 +474,7 @@ def cmd_stop(cfg: dict, display: int) -> None:
 # ───────────────────────── зеркало уже открытых окон ─────────────────────────
 # Окно, запущенное без windrift, переносится «зеркалом», без перезапуска программы:
 # владелец снимает само окно (X11: ximagesrc xid=…, композитинг даёт содержимое даже
-# перекрытого окна), кодирует H.264 с низкой задержкой и шлёт по UDP; сосед показывает
+# перекрытого окна), кодирует H.264 с низкой задержкой и шлёт по TCP; сосед показывает
 # поток в окне-копии (`windrift view`). Ввод из копии обратно — этап M2.
 
 STREAM_FPS = 30
@@ -546,23 +548,25 @@ def window_title(xid: int) -> str:
         return hex(xid)
 
 
-def free_udp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("0.0.0.0", 0))
         return s.getsockname()[1]
 
 
 def stream_pipeline(xid: int, w: int, h: int, host: str, port: int) -> list[str]:
+    """Захват окна → H.264 → TCP. TCP вместо UDP: по Wi‑Fi пакеты теряются, и картинка
+    мазалась до следующего опорного кадра. Y444: без прореживания цвета, иначе вокруг
+    текста цветная бахрома. Постоянное качество вместо битрейта: текст остаётся чётким."""
     w, h = max(2, w // 2 * 2), max(2, h // 2 * 2)   # x264 требует чётные размеры
-    kbps = max(2000, min(20000, w * h * STREAM_FPS // 3000))
     return ["gst-launch-1.0", "-q",
             "ximagesrc", f"xid={xid}", "use-damage=false", "show-pointer=false", "!",
             f"video/x-raw,framerate={STREAM_FPS}/1", "!", "videoconvert", "!", "videoscale", "!",
-            f"video/x-raw,format=I420,width={w},height={h}", "!",
-            "x264enc", "tune=zerolatency", "speed-preset=ultrafast", f"bitrate={kbps}",
-            f"key-int-max={STREAM_FPS}", "!",
-            "rtph264pay", "config-interval=1", "pt=96", "mtu=1400", "!",
-            "udpsink", f"host={host}", f"port={port}", "sync=false"]
+            f"video/x-raw,format=Y444,width={w},height={h}", "!",
+            "x264enc", "tune=zerolatency", "speed-preset=ultrafast", "pass=qual", "quantizer=20",
+            f"key-int-max={STREAM_FPS * 2}", "!", "video/x-h264,profile=high-4:4:4", "!",
+            "h264parse", "config-interval=-1", "!", "video/x-h264,stream-format=byte-stream", "!",
+            "tcpclientsink", f"host={host}", f"port={port}", "sync=false"]
 
 
 def cmd_stream(cfg: dict, xid: int, host: str, port: int) -> None:
@@ -604,10 +608,10 @@ def stream_start(cfg: dict, xid: int, geom: dict | None) -> None:
     if not reply.get("ok"):
         raise WindriftError(f"сосед не открыл окно-копию: {reply.get('error')}")
     port = int(reply["port"])
-    pid = spawn_detached([sys.executable, os.path.realpath(__file__), "stream",
+    pid = spawn_detached([sys.executable, os.path.realpath(__file__), "--config", cfg["_path"], "stream",
                           str(xid), cfg["peer"]["host"], str(port)])
     streams = streams_load()
-    streams[str(xid)] = {"pid": pid, "title": title, "port": port}
+    streams[str(xid)] = {"pid": pid, "title": title, "port": port, "size": [w, h]}
     streams_save(streams)
     log(f"окно {title!r} транслируется на {cfg['peer']['name']} (без перезапуска)")
 
@@ -618,6 +622,9 @@ def stream_stop(cfg: dict, xid: int, tell_peer: bool = True) -> None:
     streams_save(streams)
     if info:
         kill_group(info["pid"])
+        if info.get("size") and session_kind() == "x11":   # вернуть размер, какой был до переноса
+            subprocess.run(["xdotool", "windowsize", str(xid), *map(str, info["size"])],
+                           capture_output=True)
     if tell_peer:
         try:
             send_peer(cfg, {"cmd": "view_close", "owner": cfg["name"], "id": xid}, timeout=3)
@@ -628,9 +635,19 @@ def stream_stop(cfg: dict, xid: int, tell_peer: bool = True) -> None:
     log(f"окно {xid:#x} снова только здесь")
 
 
-def view_open(msg: dict) -> int:
-    port = free_udp_port()
-    pid = spawn_detached([sys.executable, os.path.realpath(__file__), "view",
+def stream_resize(xid: int, w: int, h: int) -> None:
+    """Копию у соседа растянули или сжали — подгоняем оригинал, чтобы картинка шла пиксель в пиксель."""
+    if str(xid) not in streams_load() or session_kind() != "x11":
+        return
+    sw, sh = map(int, run_out(["xdotool", "getdisplaygeometry"]).split())
+    w, h = max(200, min(w, sw)), max(150, min(h, sh))
+    subprocess.run(["xdotool", "windowsize", str(xid), str(w), str(h)], capture_output=True)
+    log(f"окно {xid:#x}: размер под копию {w}x{h}")
+
+
+def view_open(cfg: dict, msg: dict) -> int:
+    port = free_port()
+    pid = spawn_detached([sys.executable, os.path.realpath(__file__), "--config", cfg["_path"], "view",
                           "--owner", msg["owner"], "--id", str(msg["id"]), "--port", str(port),
                           "--title", msg.get("title", ""), "--size", f"{msg.get('w', 800)}x{msg.get('h', 600)}"])
     views = views_load()
@@ -655,10 +672,11 @@ def parse_view_args(args: list[str]) -> tuple[str, int] | None:
 
 
 def cmd_view(cfg_path: Path, owner: str, view_id: int, port: int, title: str, size: str) -> None:
-    """Окно-копия: принять поток H.264 по UDP и показать (GTK4 + GStreamer appsink)."""
+    """Окно-копия: принять поток H.264 по TCP и показать (GTK4 + GStreamer appsink)."""
     try:
         import gi
         gi.require_version("Gtk", "4.0")
+        gi.require_version("Gdk", "4.0")
         gi.require_version("Gst", "1.0")
         from gi.repository import GLib, Gdk, Gst, Gtk
     except (ImportError, ValueError):
@@ -666,11 +684,17 @@ def cmd_view(cfg_path: Path, owner: str, view_id: int, port: int, title: str, si
     Gst.init(None)
     w0, h0 = (int(v) for v in size.split("x"))
     pipeline = Gst.parse_launch(
-        f"udpsrc port={port} caps=\"application/x-rtp,media=video,encoding-name=H264,"
-        "payload=96,clock-rate=90000\" ! rtpjitterbuffer latency=30 drop-on-latency=true ! "
-        "rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw,format=RGBA ! "
-        "appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true")
+        f"tcpserversrc host=0.0.0.0 port={port} ! h264parse ! avdec_h264 ! videoconvert ! "
+        "video/x-raw,format=RGBA ! appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true")
     sink = pipeline.get_by_name("sink")
+
+    def tell_owner(msg: dict) -> None:
+        def work():
+            try:
+                send_peer(load_config(cfg_path), msg, timeout=2)
+            except (OSError, WindriftError):
+                pass
+        threading.Thread(target=work, daemon=True).start()
 
     def on_activate(app):
         win = Gtk.ApplicationWindow(application=app, title=f"{title} — {owner}")
@@ -692,6 +716,35 @@ def cmd_view(cfg_path: Path, owner: str, view_id: int, port: int, title: str, si
             return Gst.FlowReturn.OK
 
         sink.connect("new-sample", on_sample)
+
+        # владелец перезапускает поток при смене размера окна: соединение рвётся,
+        # и мы снова ждём подключения на том же порту
+        def restart(_bus, _msg):
+            pipeline.set_state(Gst.State.NULL)
+            GLib.timeout_add(100, lambda: pipeline.set_state(Gst.State.PLAYING) and False)
+
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::eos", restart)
+        bus.connect("message::error", restart)
+
+        # размер копии в настоящих пикселях экрана → владелец подгоняет оригинал под него
+        state = {"seen": None, "sent": None}
+
+        def check_size():
+            scale = win.get_scale_factor()
+            surface = win.get_surface()
+            if surface is not None and hasattr(surface, "get_scale"):
+                scale = surface.get_scale()          # дробный масштаб (1.25 и т.п.)
+            cur = (round(picture.get_width() * scale), round(picture.get_height() * scale))
+            if cur[0] > 50 and cur[1] > 50:
+                if cur == state["seen"] and cur != state["sent"]:
+                    state["sent"] = cur
+                    tell_owner({"cmd": "view_resize", "id": view_id, "w": cur[0], "h": cur[1]})
+                state["seen"] = cur
+            return True
+
+        GLib.timeout_add(400, check_size)
 
         def on_close(_w):
             pipeline.set_state(Gst.State.NULL)
@@ -940,10 +993,13 @@ async def handle(reader, writer, cfg: dict, clip: Clipboard | None) -> None:
         if cmd == "ping":
             reply = {"ok": True, "name": cfg["name"]}
         elif cmd == "view_open":
-            reply = {"ok": True, "port": view_open(msg)}
+            reply = {"ok": True, "port": view_open(cfg, msg)}
             log(f"окно-копия {msg.get('title')!r} от {msg['owner']}, порт {reply['port']}")
         elif cmd == "view_close":
             view_close(int(msg["id"]))
+            reply = {"ok": True}
+        elif cmd == "view_resize":
+            stream_resize(int(msg["id"]), int(msg["w"]), int(msg["h"]))
             reply = {"ok": True}
         elif cmd == "view_return":
             stream_stop(cfg, int(msg["id"]), tell_peer=False)
@@ -1602,6 +1658,29 @@ echo "  версия: ${v:-?} ($inst), сессия: $kind"
 """
 
 
+UPDATE_SH = r"""
+set -e
+d="$1"; d="${d/#\~/$HOME}"
+[ -d "$d/.git" ] || { echo "  ✗ нет папки проекта $d"; exit 1; }
+git -C "$d" pull -q --ff-only
+install -Dm755 "$d/windrift" "$HOME/.local/bin/windrift"
+echo "  ✓ $(git -C "$d" log -1 --format='%h %s' | cut -c1-70)"
+"""
+
+
+def cmd_update(cfg: dict) -> None:
+    """Обновить windrift из git на обеих машинах и перезапустить всё."""
+    d = cfg["setup"]["dir"]
+    step(f"обновление: {cfg['name']}")
+    subprocess.run(["bash", "-s", d], input=UPDATE_SH, text=True, check=True)
+    step(f"обновление: {cfg['peer']['name']}")
+    subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", cfg["peer"]["ssh"],
+                    f"bash -s {shlex.quote(d)}"], input=UPDATE_SH, text=True, check=True)
+    script = str(Path.home() / ".local/bin/windrift")
+    for action in ("down", "up"):   # новым кодом, а не тем, что уже загружен в память
+        subprocess.run([sys.executable, script, "--config", cfg["_path"], action], check=False)
+
+
 def cmd_updown(cfg: dict, action: str) -> None:
     step(f"{cfg['name']} (эта машина)")
     subprocess.run(["bash", "-s", action], input=UPDOWN_SH, text=True)
@@ -1895,6 +1974,7 @@ def main() -> None:
     sub.add_parser("up", help="запустить всё на обеих машинах: демон windrift и общую мышь")
     sub.add_parser("down", help="остановить всё на обеих машинах")
     sub.add_parser("status", help="что запущено на обеих машинах")
+    sub.add_parser("update", help="обновить windrift из git на обеих машинах и перезапустить")
     p_stream = sub.add_parser("stream", help=argparse.SUPPRESS)
     p_stream.add_argument("xid", type=int)
     p_stream.add_argument("host")
@@ -1923,6 +2003,7 @@ def main() -> None:
             case "stop": cmd_stop(load_config(a.config), a.display)
             case "doctor": cmd_doctor(load_config(a.config))
             case "up" | "down" | "status": cmd_updown(load_config(a.config), a.cmd)
+            case "update": cmd_update(load_config(a.config))
             case "stream": cmd_stream(load_config(a.config, strict=False), a.xid, a.host, a.port)
             case "view": cmd_view(a.config, a.owner, a.id, a.port, a.title, a.size or "800x600")
             case "mouse": cmd_mouse(load_config(a.config), a.config, a.action)
