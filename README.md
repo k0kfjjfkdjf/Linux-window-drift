@@ -129,7 +129,8 @@ windrift run gnome-calculator
 | `windrift update` | обновить windrift из git на обеих машинах и перезапустить |
 | `windrift doctor` | проверка зависимостей и связи |
 | `windrift mouse [stop]` | общая мышь и клавиатура в обе стороны через lan-mouse (`peer_side` — с какой стороны сосед) |
-| `windrift mouse setup` | собрать lan-mouse с патчами у соседа, обменяться отпечатками, настроить обе машины |
+| `windrift mouse setup` | собрать lan-mouse с патчами у соседа (и здесь, если его нет), обменяться отпечатками, настроить обе машины |
+| `windrift mouse build [--x11\|--wayland\|--all] [--force]` | собрать lan-mouse с патчами на этой машине и поставить в `~/.local/bin/lan-mouse` (зависимости и Rust ставит сам; по умолчанию features по типу сессии; при совпавшем штампе не пересобирает) |
 
 ## Перенос уже открытых окон (зеркало)
 
@@ -164,7 +165,8 @@ windrift run gnome-calculator
 ## План задач
 
 ### Этап 0. База (без кода)
-- [x] Общая мышь в обе стороны: `windrift mouse setup` (lan-mouse с патчами из `lan-mouse/`, шифрование DTLS). На этой машине нужен `~/.local/bin/lan-mouse`, собранный с теми же патчами, см. `lan-mouse/README.md`.
+- [x] Сборка lan-mouse с патчами на любой машине одной командой: `windrift mouse build`.
+- [x] Общая мышь в обе стороны: `windrift mouse setup` (lan-mouse с патчами из `lan-mouse/`, шифрование DTLS). Локальный lan-mouse с теми же патчами собирает `windrift mouse build`, см. `lan-mouse/README.md`.
 - [x] ssh по ключу в обе стороны (делает `setup-peer`).
 - [x] Пакеты на обеих машинах (делает `setup-peer`).
 
@@ -186,7 +188,6 @@ windrift run gnome-calculator
 
 ### Цели на потом
 - [ ] Шифрование: видеопоток зеркала и команды демонов сейчас идут по сети открыто.
-- [ ] Сборка lan-mouse с патчами на любой машине одной командой (сейчас только у соседа).
 - [ ] Аппаратное кодирование видео на ARM-платах.
 - [ ] Тесты в репозитории.
 

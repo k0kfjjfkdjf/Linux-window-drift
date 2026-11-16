@@ -22,7 +22,8 @@ sharing=no сам отключает старого клиента). Цепоч�
   windrift up | down | status   запустить / остановить / показать всё на обеих машинах
   windrift update               обновить windrift из git на обеих машинах и перезапустить
   windrift doctor               проверить зависимости и связь с соседом
-  windrift mouse [stop|setup]   общая мышь и клавиатура в обе стороны (lan-mouse; setup — собрать и настроить)
+  windrift mouse [stop|setup|build]  общая мышь и клавиатура в обе стороны (lan-mouse; setup — собрать и
+                                настроить обе машины, build — собрать lan-mouse с патчами на этой машине)
 """
 from __future__ import annotations
 
@@ -1624,35 +1625,61 @@ LANMOUSE_UPSTREAM = "https://github.com/feschber/lan-mouse"
 LANMOUSE_PORT = 4242
 LANMOUSE_CONF = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "lan-mouse"
 
-# Сборка у соседа. Rust и crates качаются через SOCKS-туннель на эту машину ($SOCKS).
-PEER_LANMOUSE_BUILD_SH = r"""
+# Сборка lan-mouse с патчами: один скрипт и для этой машины, и для соседа.
+# Окружение: COMMIT, UPSTREAM, PATCHES (пути через пробел), FEATURES, STAMP_ID;
+# необязательно: SOCKS (порт SOCKS5-туннеля до этой машины — для соседа без прямого
+# доступа в сеть; прокси для curl/rustup/cargo), FORCE=1 (пересобрать несмотря на штамп).
+LANMOUSE_BUILD_SH = r"""
 set -e
-P="socks5h://127.0.0.1:$SOCKS"
+bin="$HOME/.local/bin/lan-mouse"
+stampf="$HOME/.cache/windrift/lan-mouse.commit"
+if [ -z "$FORCE" ] && [ -x "$bin" ] && [ "$(cat "$stampf" 2>/dev/null)" = "$STAMP_ID" ]; then
+  echo "уже собран: $("$bin" --version 2>/dev/null | head -1) (штамп совпал; пересобрать: --force)"
+  exit 0
+fi
+if [ -n "$SOCKS" ]; then
+  P="socks5h://127.0.0.1:$SOCKS"
+  export ALL_PROXY="$P" HTTPS_PROXY="$P" CARGO_HTTP_PROXY="$P"
+  curl_p=(-x "$P")
+else
+  curl_p=()
+fi
 if command -v apt-get >/dev/null; then
   need=(); for p in build-essential pkg-config libx11-dev libxtst-dev git curl ca-certificates openssl; do
     dpkg -s "$p" >/dev/null 2>&1 || need+=("$p"); done
   [ ${#need[@]} -eq 0 ] || sudo apt-get install -y "${need[@]}"
 elif command -v pacman >/dev/null; then
-  sudo pacman -S --needed base-devel pkgconf libx11 libxtst git curl openssl
+  need=(); for p in base-devel pkgconf libx11 libxtst git curl openssl; do
+    pacman -Qq "$p" >/dev/null 2>&1 || pacman -Qqg "$p" >/dev/null 2>&1 || need+=("$p"); done
+  [ ${#need[@]} -eq 0 ] || sudo pacman -S --needed "${need[@]}"
+else
+  echo "неизвестный менеджер пакетов — зависимости сборки (компилятор, pkg-config, libx11/libxtst, git, curl) поставь сам"
 fi
 export PATH="$HOME/.cargo/bin:$PATH" RUSTUP_USE_CURL=1
 if ! command -v cargo >/dev/null || ! command -v rustup >/dev/null; then
-  echo "ставлю Rust (rustup) через туннель"
-  curl -x "$P" -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-  ALL_PROXY="$P" HTTPS_PROXY="$P" sh /tmp/rustup-init.sh -y --profile minimal --no-modify-path
+  echo "ставлю Rust (rustup)"
+  tmp=$(mktemp); curl "${curl_p[@]}" -sSf https://sh.rustup.rs -o "$tmp"
+  sh "$tmp" -y --profile minimal --no-modify-path; rm -f "$tmp"
+  export PATH="$HOME/.cargo/bin:$PATH"
 else
-  ALL_PROXY="$P" HTTPS_PROXY="$P" rustup update stable --no-self-update || true
+  rustup update stable --no-self-update || true
 fi
 src="$HOME/.cache/windrift/lan-mouse"
+mkdir -p "$(dirname "$src")"
 [ -d "$src/.git" ] || git clone -q --filter=blob:none "$UPSTREAM" "$src"
 git -C "$src" fetch -q origin "$COMMIT" || git -C "$src" fetch -q origin
 git -C "$src" checkout -q -f "$COMMIT"
-git -C "$src" apply "$PATCH"
+git -C "$src" clean -qfd
+for p in $PATCHES; do
+  echo "патч: $(basename "$p")"
+  git -C "$src" apply "$p"
+done
 cd "$src"
-echo "собираю lan-mouse (на ARM это займёт 10–30 минут)"
-CARGO_HTTP_PROXY="$P" cargo build --release --no-default-features --features "$FEATURES"
-install -Dm755 target/release/lan-mouse "$HOME/.local/bin/lan-mouse"
-echo "lan-mouse установлен: $("$HOME/.local/bin/lan-mouse" --version 2>/dev/null | head -1)"
+echo "собираю lan-mouse (features: $FEATURES; на ARM это займёт 10–30 минут)"
+cargo build --release --no-default-features --features "$FEATURES"
+install -Dm755 target/release/lan-mouse "$bin"
+mkdir -p "$(dirname "$stampf")"; echo "$STAMP_ID" > "$stampf"
+echo "lan-mouse установлен: $("$bin" --version 2>/dev/null | head -1)"
 """
 
 # Сертификат lan-mouse (как у него самого: самоподписанный ECDSA P-256) и его отпечаток.
@@ -1740,6 +1767,57 @@ def lanmouse_start_local(bin_path: str) -> None:
         raise WindriftError(f"lan-mouse здесь завершился (код {proc.returncode}), лог: {log_path}")
 
 
+LANMOUSE_PATCH_NAMES = ["x11-input-capture.patch", "hyprland-reenter-guard.patch"]
+LANMOUSE_FEATURES = {
+    "x11": "x11_capture,x11_emulation",
+    "wayland": "layer_shell_capture,wlroots_emulation,libei_capture,libei_emulation",
+}
+
+
+def lanmouse_features(kinds: list[str]) -> str:
+    """features cargo для набора типов сессии (без повторов, порядок сохраняется)."""
+    out: list[str] = []
+    for k in kinds:
+        out += [f for f in LANMOUSE_FEATURES[k].split(",") if f not in out]
+    return ",".join(out)
+
+
+def lanmouse_sources(cfg: dict) -> tuple[Path, str, list[Path], str]:
+    """(папка проекта, коммит апстрима, патчи, штамп без features). Патчи лежат в папке
+    проекта (setup.dir) или рядом со скриптом, а не рядом с установленным ~/.local/bin/windrift."""
+    candidates = [Path(os.path.expanduser(cfg["setup"]["dir"])), Path(os.path.realpath(__file__)).parent]
+    repo = next((c for c in candidates if (c / "lan-mouse" / LANMOUSE_PATCH_NAMES[0]).exists()), candidates[0])
+    commit_file = repo / "lan-mouse" / "UPSTREAM_COMMIT"
+    patches = [repo / "lan-mouse" / n for n in LANMOUSE_PATCH_NAMES]
+    commit = (commit_file.read_text().strip() if commit_file.exists()
+              else subprocess.run(["git", "-C", str(repo), "show", "HEAD:lan-mouse/UPSTREAM_COMMIT"],
+                                  capture_output=True, text=True).stdout.strip())
+    if not commit or not all(p.exists() for p in patches):
+        raise WindriftError("нет lan-mouse/UPSTREAM_COMMIT или патчей — обнови репозиторий windrift (git pull)")
+    h = hashlib.sha256()
+    for p in patches:
+        h.update(p.read_bytes())
+    return repo, commit, patches, f"{commit}:{h.hexdigest()[:12]}"
+
+
+def cmd_mouse_build(cfg: dict, kinds: list[str] | None = None, force: bool = False) -> None:
+    """Собрать lan-mouse с патчами на ЭТОЙ машине и поставить в ~/.local/bin/lan-mouse."""
+    if not kinds:
+        kind = session_kind()
+        if kind == "none":
+            print("графическая сессия не найдена — собираю для X11 (оба набора: --all)")
+            kind = "x11"
+        kinds = [kind]
+    _, commit, patches, stamp = lanmouse_sources(cfg)
+    features = lanmouse_features(kinds)
+    env = {**os.environ, "COMMIT": commit, "UPSTREAM": LANMOUSE_UPSTREAM, "FEATURES": features,
+           "PATCHES": " ".join(shlex.quote(str(p)) for p in patches),
+           "STAMP_ID": f"{stamp}:{features}", "FORCE": "1" if force else ""}
+    env.pop("SOCKS", None)
+    step(f"сборка lan-mouse здесь ({', '.join(kinds)}; может спросить пароль sudo)")
+    subprocess.run(["bash", "-c", LANMOUSE_BUILD_SH], env=env, check=True)
+
+
 def cmd_mouse_setup(cfg: dict, config_path: Path) -> None:
     me, peer, target = cfg["name"], cfg["peer"]["name"], cfg["peer"]["ssh"]
     side = cfg["peer_side"]
@@ -1747,21 +1825,11 @@ def cmd_mouse_setup(cfg: dict, config_path: Path) -> None:
         raise WindriftError(f"peer_side должен быть одним из {', '.join(OPPOSITE)}")
     bin_path = lanmouse_bin()
     if not bin_path:
-        raise WindriftError("здесь нет lan-mouse: положи сборку в ~/.local/bin/lan-mouse "
-                            "или поставь пакет (pacman -S lan-mouse)")
-    # патч лежит в папке проекта (setup.dir), а не рядом с установленным ~/.local/bin/windrift
-    candidates = [Path(os.path.expanduser(cfg["setup"]["dir"])), Path(os.path.realpath(__file__)).parent]
-    repo = next((c for c in candidates if (c / "lan-mouse" / "x11-input-capture.patch").exists()), candidates[0])
-    patch = repo / "lan-mouse" / "x11-input-capture.patch"
-    commit_file = repo / "lan-mouse" / "UPSTREAM_COMMIT"
+        print("здесь нет lan-mouse — собираю его с патчами (windrift mouse build)")
+        cmd_mouse_build(cfg)
+    _, commit, _patches, stamp = lanmouse_sources(cfg)
     s = cfg["setup"]
     peer_repo = s["dir"].replace("~", "$HOME", 1)
-    commit = (commit_file.read_text().strip() if commit_file.exists()
-              else subprocess.run(["git", "-C", str(repo), "show", "HEAD:lan-mouse/UPSTREAM_COMMIT"],
-                                  capture_output=True, text=True).stdout.strip())
-    if not commit or not patch.exists():
-        raise WindriftError("нет lan-mouse/UPSTREAM_COMMIT или патча — обнови репозиторий windrift (git pull)")
-    build_id = f"{commit}:{hashlib.sha256(patch.read_bytes()).hexdigest()[:12]}"
 
     step(f"1/5 windrift и патч lan-mouse на {peer}")
     remote_bash(target, f"""set -e
@@ -1769,26 +1837,18 @@ d="{peer_repo}"
 if [ -d "$d/.git" ]; then git -C "$d" fetch -q origin && git -C "$d" reset -q --hard FETCH_HEAD
 else git clone -q {shlex.quote(s["repo"])} "$d"; fi
 install -Dm755 "$d/windrift" "$HOME/.local/bin/windrift"
-test -f "$d/lan-mouse/x11-input-capture.patch" && echo "патч на месте"
+test -f "$d/lan-mouse/x11-input-capture.patch" && echo "патчи на месте"
 """)
 
     step(f"2/5 сборка lan-mouse на {peer} (может спросить пароль sudo)")
-    have = remote_bash(target, '[ -x "$HOME/.local/bin/lan-mouse" ] && "$HOME/.local/bin/lan-mouse" --version '
-                               '2>/dev/null | head -1 || true', capture=True).stdout.strip()
-    stamp = remote_bash(target, 'cat "$HOME/.cache/windrift/lan-mouse.commit" 2>/dev/null || true',
-                        capture=True).stdout.strip()
-    if have and stamp == build_id:
-        print(f"уже собран: {have}")
-    else:
-        sport = 20000 + secrets.randbelow(30000)
-        peer_kind = remote_bash(target, SESSION_ENV_SH + 'echo "$kind"', capture=True).stdout.strip() or "x11"
-        features = "x11_capture,x11_emulation" if peer_kind != "wayland" else \
-            "layer_shell_capture,wlroots_emulation,libei_capture,libei_emulation"
-        env = (f"SOCKS={sport} COMMIT={commit} UPSTREAM={LANMOUSE_UPSTREAM} FEATURES={features} "
-               f"PATCH={peer_repo}/lan-mouse/x11-input-capture.patch")
-        remote_bash(target, "export " + env + "\n" + PEER_LANMOUSE_BUILD_SH +
-                    f'\nmkdir -p "$HOME/.cache/windrift"; echo "{build_id}" > "$HOME/.cache/windrift/lan-mouse.commit"\n',
-                    tty=True, socks_port=sport)
+    peer_kind = remote_bash(target, SESSION_ENV_SH + 'echo "$kind"', capture=True).stdout.strip() or "x11"
+    features = lanmouse_features(["wayland" if peer_kind == "wayland" else "x11"])
+    sport = 20000 + secrets.randbelow(30000)
+    # сосед качает Rust и crates через SOCKS-туннель на эту машину; штамп проверяет сам скрипт
+    env = (f"SOCKS={sport} COMMIT={commit} UPSTREAM={LANMOUSE_UPSTREAM} FEATURES={features} "
+           f"STAMP_ID={shlex.quote(f'{stamp}:{features}')} "
+           f"PATCHES={shlex.quote(' '.join(f'{peer_repo}/lan-mouse/{n}' for n in LANMOUSE_PATCH_NAMES))}")
+    remote_bash(target, "export " + env + "\n" + LANMOUSE_BUILD_SH, tty=True, socks_port=sport)
 
     step("3/5 сертификаты и отпечатки")
     my_pem = subprocess.run(["bash", "-c", CERT_SH], capture_output=True, text=True, check=True).stdout
@@ -1843,7 +1903,10 @@ def cmd_mouse_lanmouse(cfg: dict, action: str) -> None:
           f"с любой из мышей. Логи: {RUNTIME}/lan-mouse.log здесь и у соседа."
           "\nОстановить: windrift mouse stop")
 
-def cmd_mouse(cfg: dict, config_path: Path, action: str) -> None:
+def cmd_mouse(cfg: dict, config_path: Path, action: str, kinds: list[str] | None = None,
+              force: bool = False) -> None:
+    if action == "build":
+        return cmd_mouse_build(cfg, kinds, force)
     if action == "setup":
         return cmd_mouse_setup(cfg, config_path)
     if lanmouse_bin() and (LANMOUSE_CONF / "config.toml").exists() and action != "deskflow":
@@ -2280,9 +2343,18 @@ def main() -> None:
     p_view.add_argument("--id", type=int, required=True)
     p_view.add_argument("--port", type=int, required=True)
     p_mouse = sub.add_parser("mouse", help="общая мышь через Deskflow: сервер здесь, клиент у соседа")
-    p_mouse.add_argument("action", nargs="?", default="start", choices=["start", "stop", "setup", "deskflow"],
+    p_mouse.add_argument("action", nargs="?", default="start", choices=["start", "stop", "setup", "build", "deskflow"],
                          help="setup — собрать и настроить lan-mouse на обеих машинах (мышь в обе стороны); "
+                              "build — только собрать lan-mouse с патчами на этой машине; "
                               "deskflow — старый вариант в одну сторону")
+    g_ = p_mouse.add_mutually_exclusive_group()
+    g_.add_argument("--x11", dest="kinds", action="store_const", const=["x11"],
+                    help="build: собрать с X11-перехватом (по умолчанию — по типу текущей сессии)")
+    g_.add_argument("--wayland", dest="kinds", action="store_const", const=["wayland"],
+                    help="build: собрать с Wayland-перехватом")
+    g_.add_argument("--all", dest="kinds", action="store_const", const=["x11", "wayland"],
+                    help="build: оба набора features сразу")
+    p_mouse.add_argument("--force", action="store_true", help="build: пересобрать, даже если штамп совпал")
     a = ap.parse_args()
 
     try:
@@ -2301,7 +2373,7 @@ def main() -> None:
             case "update": cmd_update(load_config(a.config))
             case "stream": cmd_stream(load_config(a.config, strict=False), a.xid, a.host, a.port)
             case "view": cmd_view(a.config, a.owner, a.id, a.port, a.title, a.size or "800x600")
-            case "mouse": cmd_mouse(load_config(a.config), a.config, a.action)
+            case "mouse": cmd_mouse(load_config(a.config, strict=a.action != "build"), a.config, a.action, a.kinds, a.force)
     except (WindriftError, OSError, subprocess.CalledProcessError) as e:
         notify(f"ошибка: {e}")
         sys.exit(1)
