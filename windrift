@@ -576,26 +576,44 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def stream_pipeline(xid: int, w: int, h: int, host: str, port: int) -> list[str]:
-    """Захват окна → H.264 → TCP. TCP вместо UDP: по Wi‑Fi пакеты теряются, и картинка
-    мазалась до следующего опорного кадра. Y444: без прореживания цвета, иначе вокруг
-    текста цветная бахрома. Постоянное качество вместо битрейта: текст остаётся чётким."""
+def stream_pipeline(xid: int, w: int, h: int, fd: int) -> list[str]:
+    """Захват окна → H.264 → уже открытое TCP-соединение (fd). TCP: по Wi‑Fi пакеты теряются,
+    и по UDP картинка мазалась. Y444: без прореживания цвета, иначе вокруг текста цветная
+    бахрома. Постоянное качество вместо битрейта: текст остаётся чётким."""
     w, h = max(2, w // 2 * 2), max(2, h // 2 * 2)   # x264 требует чётные размеры
     return ["gst-launch-1.0", "-q",
             "ximagesrc", f"xid={xid}", "use-damage=false", "show-pointer=false", "!",
-            f"video/x-raw,framerate={STREAM_FPS}/1", "!", "videoconvert", "!", "videoscale", "!",
-            f"video/x-raw,format=Y444,width={w},height={h}", "!",
+            f"video/x-raw,framerate={STREAM_FPS}/1", "!", "videoconvert", "n-threads=4", "!",
+            "videoscale", "!", f"video/x-raw,format=Y444,width={w},height={h}", "!",
             "x264enc", "tune=zerolatency", "speed-preset=ultrafast", "pass=qual", "quantizer=20",
             f"key-int-max={STREAM_FPS * 2}", "!", "video/x-h264,profile=high-4:4:4", "!",
             "h264parse", "config-interval=-1", "!", "video/x-h264,stream-format=byte-stream", "!",
-            "tcpclientsink", f"host={host}", f"port={port}", "sync=false"]
+            "fdsink", f"fd={fd}", "sync=false"]
+
+
+def stream_connect(host: str, port: int, tries: int = 50) -> socket.socket:
+    """Соединение с окном-копией; оно открывается секунду-две, поэтому с повторами."""
+    last = None
+    for _ in range(tries):
+        try:
+            sock = socket.create_connection((host, port), timeout=3)
+            sock.settimeout(None)
+            # без Нейгла: маленькие кадры уходят сразу, а не ждут подтверждения предыдущих
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            return sock
+        except OSError as e:
+            last = e
+            time.sleep(0.2)
+    raise WindriftError(f"окно-копия не принимает соединение {host}:{port}: {last}")
 
 
 def cmd_stream(cfg: dict, xid: int, host: str, port: int) -> None:
-    """Транслировать окно, пока оно существует; при смене размера — перезапуск потока."""
+    """Транслировать окно, пока оно существует. Соединение одно на всю трансляцию:
+    при смене размера перезапускается только кодировщик, без переподключения."""
     if not shutil.which("gst-launch-1.0"):
         raise WindriftError("нет GStreamer: windrift setup-peer поставит его соседу; "
                             "здесь — gstreamer, gst-plugins-good/ugly/libav")
+    sock = stream_connect(host, port)
     proc, size, fails = None, None, 0
     try:
         while True:
@@ -611,24 +629,32 @@ def cmd_stream(cfg: dict, xid: int, host: str, port: int) -> None:
                     pass
                 return
             if (w, h) != size or proc is None or proc.poll() is not None:
+                crashed = proc is not None and (w, h) == size
                 if proc and proc.poll() is None:
                     proc.terminate()
                     proc.wait(timeout=5)
-                crashed = proc is not None and (w, h) == size
                 size = (w, h)
                 if crashed:
                     fails += 1
                     if fails in (3, 10) or fails % 30 == 0:
                         log(f"захват окна {xid:#x} падает {fails} раз подряд — см. ошибку GStreamer выше")
+                    try:   # соединение могло оборваться (копию закрыли, сеть) — пробуем заново
+                        sock.close()
+                        sock = stream_connect(host, port, tries=5)
+                    except WindriftError as e:
+                        log(str(e))
+                        time.sleep(1)
+                        continue
                 else:
                     fails = 0
-                proc = subprocess.Popen(stream_pipeline(xid, w, h, host, port),
-                                        stdin=subprocess.DEVNULL)
+                proc = subprocess.Popen(stream_pipeline(xid, w, h, sock.fileno()),
+                                        stdin=subprocess.DEVNULL, pass_fds=(sock.fileno(),))
                 log(f"трансляция {xid:#x} {w}x{h} → {host}:{port}")
-            time.sleep(1)
+            time.sleep(0.3)
     finally:
         if proc and proc.poll() is None:
             proc.terminate()
+        sock.close()
 
 
 def stream_start(cfg: dict, xid: int, geom: dict | None) -> None:
@@ -717,9 +743,37 @@ def cmd_view(cfg_path: Path, owner: str, view_id: int, port: int, title: str, si
     Gst.init(None)
     w0, h0 = (int(v) for v in size.split("x"))
     pipeline = Gst.parse_launch(
-        f"tcpserversrc host=0.0.0.0 port={port} ! h264parse ! avdec_h264 ! videoconvert ! "
-        "video/x-raw,format=RGBA ! appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true")
-    sink = pipeline.get_by_name("sink")
+        "appsrc name=src is-live=true do-timestamp=true format=time "
+        "caps=video/x-h264,stream-format=byte-stream ! h264parse ! avdec_h264 ! "
+        "videoconvert n-threads=4 ! video/x-raw,format=RGBA ! "
+        "appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true")
+    sink, src = pipeline.get_by_name("sink"), pipeline.get_by_name("src")
+
+    # Слушаем сами и не закрываем порт: владелец держит одно соединение на всю трансляцию,
+    # а если оно оборвётся — просто подключится снова.
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", port))
+    server.listen(2)
+
+    def receive():
+        while True:
+            try:
+                conn, _addr = server.accept()
+            except OSError:
+                return
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            with conn:
+                while True:
+                    try:
+                        chunk = conn.recv(1 << 16)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    src.emit("push-buffer", Gst.Buffer.new_wrapped(chunk))
+
+    threading.Thread(target=receive, daemon=True).start()
 
     def tell_owner(msg: dict) -> None:
         def work():
@@ -735,6 +789,20 @@ def cmd_view(cfg_path: Path, owner: str, view_id: int, port: int, title: str, si
         picture = Gtk.Picture(can_shrink=True, content_fit=Gtk.ContentFit.CONTAIN)
         win.set_child(picture)
 
+        # Показываем только самый свежий кадр. Если ставить в очередь каждый, GTK не успевает
+        # за большим окном, очередь растёт и картинка отстаёт всё сильнее.
+        latest = {"frame": None, "pending": False}
+        lock = threading.Lock()
+
+        def show_latest():
+            with lock:
+                frame, latest["frame"], latest["pending"] = latest["frame"], None, False
+            if frame:
+                data, w, h = frame
+                picture.set_paintable(
+                    Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.R8G8B8A8, GLib.Bytes.new(data), w * 4))
+            return False
+
         def on_sample(appsink):
             sample = appsink.emit("pull-sample")
             caps = sample.get_caps().get_structure(0)
@@ -742,23 +810,25 @@ def cmd_view(cfg_path: Path, owner: str, view_id: int, port: int, title: str, si
             buf = sample.get_buffer()
             ok, info = buf.map(Gst.MapFlags.READ)
             if ok:
-                data = GLib.Bytes.new(info.data)
+                data = bytes(info.data)
                 buf.unmap(info)
-                tex = Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.R8G8B8A8, data, w * 4)
-                GLib.idle_add(lambda: picture.set_paintable(tex) and False)
+                with lock:
+                    latest["frame"] = (data, w, h)
+                    schedule, latest["pending"] = not latest["pending"], True
+                if schedule:
+                    GLib.idle_add(show_latest, priority=GLib.PRIORITY_DEFAULT)
             return Gst.FlowReturn.OK
 
         sink.connect("new-sample", on_sample)
 
-        # владелец перезапускает поток при смене размера окна: соединение рвётся,
-        # и мы снова ждём подключения на том же порту
+        # декодер споткнулся (например, оборванный кадр при смене размера) — перезапускаем его;
+        # приём по сети при этом не прерывается
         def restart(_bus, _msg):
             pipeline.set_state(Gst.State.NULL)
-            GLib.timeout_add(100, lambda: pipeline.set_state(Gst.State.PLAYING) and False)
+            GLib.timeout_add(50, lambda: pipeline.set_state(Gst.State.PLAYING) and False)
 
         bus = pipeline.get_bus()
         bus.add_signal_watch()
-        bus.connect("message::eos", restart)
         bus.connect("message::error", restart)
 
         # размер копии в настоящих пикселях экрана → владелец подгоняет оригинал под него
@@ -795,6 +865,7 @@ def cmd_view(cfg_path: Path, owner: str, view_id: int, port: int, title: str, si
     app.connect("activate", on_activate)
     app.run([])
     pipeline.set_state(Gst.State.NULL)
+    server.close()
 
 
 # ───────────────────────── бэкенды композиторов ─────────────────────────
