@@ -607,6 +607,115 @@ def stream_connect(host: str, port: int, tries: int = 50) -> socket.socket:
     raise WindriftError(f"окно-копия не принимает соединение {host}:{port}: {last}")
 
 
+class XInject:
+    """Ввод в окно-оригинал на X11 через XTEST: события из окна-копии приходят по тому же
+    соединению, что и видео, только в обратную сторону — JSON-строками.
+      {"t":"m","x":fx,"y":fy}            движение, координаты в долях окна (0..1)
+      {"t":"b","b":1,"p":1,"x":..,"y":..} кнопка мыши
+      {"t":"s","dx":0,"dy":1}            колесо, в щелчках
+      {"t":"k","c":38,"p":1,"g":0}       клавиша: X-keycode и номер раскладки у соседа
+      {"t":"f","on":1}                   копия получила / потеряла фокус
+    XTEST двигает настоящий курсор этой машины, поэтому оригинал должен быть виден."""
+
+    EDGE = 3   # не подводим курсор к самому краю экрана: там его перехватывает общая мышь
+
+    def __init__(self, xid: int):
+        import ctypes
+        import ctypes.util
+        self.c = ctypes
+        self.x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+        self.xtst = ctypes.CDLL(ctypes.util.find_library("Xtst") or "libXtst.so.6")
+        self.x11.XOpenDisplay.restype = ctypes.c_void_p
+        self.dpy = ctypes.c_void_p(self.x11.XOpenDisplay(None))
+        if not self.dpy:
+            raise WindriftError("XInject: не открыть X-дисплей")
+        self.xid = xid
+        self.rect = (0, 0, 1, 1)
+        self.sw, self.sh = map(int, run_out(["xdotool", "getdisplaygeometry"]).split())
+        self.keys: set[int] = set()
+        self.buttons: set[int] = set()
+        self.group = None
+        self.scroll = [0.0, 0.0]
+
+    def _move(self, fx: float, fy: float) -> None:
+        x, y, w, h = self.rect
+        px = min(max(round(x + fx * w), self.EDGE), self.sw - 1 - self.EDGE)
+        py = min(max(round(y + fy * h), self.EDGE), self.sh - 1 - self.EDGE)
+        self.xtst.XTestFakeMotionEvent(self.dpy, -1, px, py, 0)
+
+    def _button(self, button: int, press: bool) -> None:
+        self.xtst.XTestFakeButtonEvent(self.dpy, button, int(press), 0)
+        (self.buttons.add if press else self.buttons.discard)(button)
+
+    def _key(self, code: int, press: bool) -> None:
+        self.xtst.XTestFakeKeyEvent(self.dpy, code, int(press), 0)
+        (self.keys.add if press else self.keys.discard)(code)
+
+    def release_all(self) -> None:
+        """Отпустить всё зажатое: иначе клавиша «залипнет», если копия потеряла фокус или закрылась."""
+        for code in list(self.keys):
+            self._key(code, False)
+        for button in list(self.buttons):
+            self._button(button, False)
+        self.x11.XFlush(self.dpy)
+
+    def activate(self) -> None:
+        for cmd in ("windowraise", "windowactivate"):
+            subprocess.run(["xdotool", cmd, str(self.xid)], capture_output=True, timeout=3)
+
+    def handle(self, ev: dict) -> None:
+        t = ev.get("t")
+        if t == "m":
+            self._move(float(ev["x"]), float(ev["y"]))
+        elif t == "b":
+            self._move(float(ev["x"]), float(ev["y"]))
+            self._button(int(ev["b"]), bool(ev["p"]))
+        elif t == "s":
+            for axis, (neg, pos) in enumerate(((6, 7), (4, 5))):   # dx → кнопки 6/7, dy → 4/5
+                self.scroll[axis] += float(ev.get("dx" if axis == 0 else "dy", 0))
+                while abs(self.scroll[axis]) >= 1:
+                    button = pos if self.scroll[axis] > 0 else neg
+                    self.scroll[axis] -= 1 if self.scroll[axis] > 0 else -1
+                    self.xtst.XTestFakeButtonEvent(self.dpy, button, 1, 0)
+                    self.xtst.XTestFakeButtonEvent(self.dpy, button, 0, 0)
+        elif t == "k":
+            code, press = int(ev["c"]), bool(ev["p"])
+            if not 8 <= code <= 255 or (press and code in self.keys):
+                return
+            group = ev.get("g")
+            if press and group is not None and group != self.group:
+                self.group = group   # та же раскладка, что у соседа (0x100 = основная клавиатура)
+                self.x11.XkbLockGroup(self.dpy, 0x100, int(group))
+            self._key(code, press)
+        elif t == "f":
+            if ev.get("on"):
+                self.activate()
+            else:
+                self.release_all()
+        self.x11.XFlush(self.dpy)
+
+
+def input_reader(sock: socket.socket, inject: "XInject") -> None:
+    """Читать события ввода от окна-копии, пока живо соединение."""
+    buf = b""
+    try:
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            *lines, buf = buf.split(b"\n")
+            for line in lines:
+                try:
+                    inject.handle(json.loads(line))
+                except (ValueError, KeyError, TypeError) as e:
+                    log(f"ввод: непонятное событие {line[:80]!r}: {e}")
+    except OSError:
+        pass
+    finally:
+        inject.release_all()
+
+
 def cmd_stream(cfg: dict, xid: int, host: str, port: int) -> None:
     """Транслировать окно, пока оно существует. Соединение одно на всю трансляцию:
     при смене размера перезапускается только кодировщик, без переподключения."""
@@ -614,13 +723,23 @@ def cmd_stream(cfg: dict, xid: int, host: str, port: int) -> None:
         raise WindriftError("нет GStreamer: windrift setup-peer поставит его соседу; "
                             "здесь — gstreamer, gst-plugins-good/ugly/libav")
     sock = stream_connect(host, port)
+    inject = None
+    if session_kind() == "x11":
+        try:
+            inject = XInject(xid)
+            threading.Thread(target=input_reader, args=(sock, inject), daemon=True).start()
+        except (OSError, WindriftError, AttributeError) as e:
+            log(f"ввод из копии недоступен (нужны libX11 и libXtst): {e}")
     proc, size, fails = None, None, 0
     try:
         while True:
             try:
                 if keep_on_screen(xid):
                     log(f"окно {xid:#x} выходило за край экрана — вернул, иначе захват невозможен")
-                _, _, w, h = window_rect(xid)
+                rect = window_rect(xid)
+                _, _, w, h = rect
+                if inject:
+                    inject.rect = rect
             except (WindriftError, subprocess.TimeoutExpired):
                 log(f"окно {xid:#x} закрыто — трансляция окончена")
                 try:   # иначе у соседа останется застывшая копия
@@ -641,6 +760,9 @@ def cmd_stream(cfg: dict, xid: int, host: str, port: int) -> None:
                     try:   # соединение могло оборваться (копию закрыли, сеть) — пробуем заново
                         sock.close()
                         sock = stream_connect(host, port, tries=5)
+                        if inject:
+                            threading.Thread(target=input_reader, args=(sock, inject),
+                                             daemon=True).start()
                     except WindriftError as e:
                         log(str(e))
                         time.sleep(1)
@@ -764,6 +886,7 @@ def cmd_view(cfg_path: Path, owner: str, view_id: int, port: int, title: str, si
                 return
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             with conn:
+                link["conn"] = conn
                 while True:
                     try:
                         chunk = conn.recv(1 << 16)
@@ -772,8 +895,22 @@ def cmd_view(cfg_path: Path, owner: str, view_id: int, port: int, title: str, si
                     if not chunk:
                         break
                     src.emit("push-buffer", Gst.Buffer.new_wrapped(chunk))
+                link["conn"] = None
 
+    link = {"conn": None}
+    link_lock = threading.Lock()
     threading.Thread(target=receive, daemon=True).start()
+
+    def send_input(ev: dict) -> None:
+        """Событие ввода владельцу — по тому же соединению, что и видео, в обратную сторону."""
+        conn = link["conn"]
+        if conn is None:
+            return
+        try:
+            with link_lock:
+                conn.sendall(json.dumps(ev, separators=(",", ":")).encode() + b"\n")
+        except OSError:
+            pass
 
     def tell_owner(msg: dict) -> None:
         def work():
@@ -788,6 +925,59 @@ def cmd_view(cfg_path: Path, owner: str, view_id: int, port: int, title: str, si
         win.set_default_size(w0, h0)
         picture = Gtk.Picture(can_shrink=True, content_fit=Gtk.ContentFit.CONTAIN)
         win.set_child(picture)
+        frame_size = [w0, h0]
+
+        def frac(x: float, y: float) -> tuple[float, float]:
+            """Точка в окне-копии → доли окна-оригинала (картинка вписана с сохранением пропорций)."""
+            pw, ph = max(1, picture.get_width()), max(1, picture.get_height())
+            fw, fh = frame_size
+            k = min(pw / fw, ph / fh)
+            dw, dh = fw * k, fh * k
+            fx, fy = (x - (pw - dw) / 2) / dw, (y - (ph - dh) / 2) / dh
+            return round(min(max(fx, 0.0), 1.0), 5), round(min(max(fy, 0.0), 1.0), 5)
+
+        pointer = {"x": 0.0, "y": 0.0, "sent": 0.0}
+
+        def on_motion(_c, x, y):
+            pointer["x"], pointer["y"] = frac(x, y)
+            now = time.monotonic()
+            if now - pointer["sent"] >= 1 / 120:       # не чаще 120 раз в секунду
+                pointer["sent"] = now
+                send_input({"t": "m", "x": pointer["x"], "y": pointer["y"]})
+
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", on_motion)
+        picture.add_controller(motion)
+
+        def on_button(gesture, _n, x, y, press):
+            fx, fy = frac(x, y)
+            send_input({"t": "b", "b": gesture.get_current_button(), "p": int(press), "x": fx, "y": fy})
+
+        click = Gtk.GestureClick(button=0)             # 0 — все кнопки мыши
+        click.connect("pressed", lambda g, n, x, y: on_button(g, n, x, y, True))
+        click.connect("released", lambda g, n, x, y: on_button(g, n, x, y, False))
+        picture.add_controller(click)
+
+        def on_scroll(_c, dx, dy):
+            send_input({"t": "s", "dx": dx, "dy": dy})
+            return True
+
+        scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.BOTH_AXES)
+        scroll.connect("scroll", on_scroll)
+        picture.add_controller(scroll)
+
+        def on_key(ctrl, _keyval, keycode, _state, press):
+            send_input({"t": "k", "c": keycode, "p": int(press), "g": ctrl.get_group()})
+            return True                                # не отдаём клавиши самому GTK
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda c, kv, kc, st: on_key(c, kv, kc, st, True))
+        keys.connect("key-released", lambda c, kv, kc, st: on_key(c, kv, kc, st, False) and None)
+        win.add_controller(keys)
+
+        # копия в фокусе → оригинал поднимается и получает фокус; потеряла фокус → отпустить зажатое
+        win.connect("notify::is-active",
+                    lambda w, _p: send_input({"t": "f", "on": int(w.is_active())}))
 
         # Показываем только самый свежий кадр. Если ставить в очередь каждый, GTK не успевает
         # за большим окном, очередь растёт и картинка отстаёт всё сильнее.
@@ -799,6 +989,7 @@ def cmd_view(cfg_path: Path, owner: str, view_id: int, port: int, title: str, si
                 frame, latest["frame"], latest["pending"] = latest["frame"], None, False
             if frame:
                 data, w, h = frame
+                frame_size[:] = [w, h]
                 picture.set_paintable(
                     Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.R8G8B8A8, GLib.Bytes.new(data), w * 4))
             return False
