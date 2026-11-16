@@ -126,7 +126,8 @@ windrift run gnome-calculator
 | `windrift back [N]` | вернуть свои окна на эту машину (все или сессию :N), даже если до соседа не дотянуться мышью |
 | `windrift list` / `stop <N>` | локальные сессии / остановить сессию |
 | `windrift doctor` | проверка зависимостей и связи |
-| `windrift mouse [stop]` | общая мышь и клавиатура через Deskflow: сервер на этой машине, клиент у соседа (`peer_side` — с какой стороны сосед) |
+| `windrift mouse [stop]` | общая мышь и клавиатура в обе стороны через lan-mouse (`peer_side` — с какой стороны сосед) |
+| `windrift mouse setup` | собрать lan-mouse с патчами у соседа, обменяться отпечатками, настроить обе машины |
 
 ## Перенос уже открытых окон (зеркало)
 
@@ -155,7 +156,7 @@ windrift run gnome-calculator
 ## План задач
 
 ### Этап 0. База (без кода)
-- [x] Общая мышь: `windrift mouse` запускает Deskflow (сервер здесь, клиент у соседа). Нужен `deskflow` на обеих машинах, на Hyprland — портал InputCapture (xdg-desktop-portal-hyprland 1.5+). TLS пока выключен, трафик мыши и клавиатуры идёт открыто по локальной сети.
+- [x] Общая мышь в обе стороны: `windrift mouse setup` (lan-mouse с патчами из `lan-mouse/`, шифрование DTLS). На этой машине нужен `~/.local/bin/lan-mouse`, собранный с теми же патчами, см. `lan-mouse/README.md`.
 - [x] ssh по ключу в обе стороны (делает `setup-peer`).
 - [x] Пакеты на обеих машинах (делает `setup-peer`).
 

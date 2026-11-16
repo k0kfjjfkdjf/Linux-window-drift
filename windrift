@@ -564,7 +564,7 @@ def stream_pipeline(xid: int, w: int, h: int, host: str, port: int) -> list[str]
             "udpsink", f"host={host}", f"port={port}", "sync=false"]
 
 
-def cmd_stream(xid: int, host: str, port: int) -> None:
+def cmd_stream(cfg: dict, xid: int, host: str, port: int) -> None:
     """Транслировать окно, пока оно существует; при смене размера — перезапуск потока."""
     if not shutil.which("gst-launch-1.0"):
         raise WindriftError("нет GStreamer: windrift setup-peer поставит его соседу; "
@@ -576,6 +576,10 @@ def cmd_stream(xid: int, host: str, port: int) -> None:
                 _, _, w, h = window_rect(xid)
             except (WindriftError, subprocess.TimeoutExpired):
                 log(f"окно {xid:#x} закрыто — трансляция окончена")
+                try:   # иначе у соседа останется застывшая копия
+                    send_peer(cfg, {"cmd": "view_close", "owner": cfg["name"], "id": xid}, timeout=3)
+                except (OSError, WindriftError, KeyError):
+                    pass
                 return
             if (w, h) != size or proc is None or proc.poll() is not None:
                 if proc and proc.poll() is None:
@@ -972,8 +976,10 @@ async def daemon(cfg: dict) -> None:
     clip = Clipboard(cfg) if cfg["clipboard"] and Clipboard.available() else None
     if cfg["clipboard"] and not clip:
         log("буфер обмена выключен: нет wl-paste/wl-copy (Wayland) или xclip (X11)")
+    # лимит строки по умолчанию 64 КБ — большой буфер обмена в него не влезал
+    limit = max(1 << 20, int(cfg["clipboard_max_kb"]) * 1024 * 8)
     server = await asyncio.start_server(lambda r, w: handle(r, w, cfg, clip),
-                                        cfg["listen"], cfg["port"])
+                                        cfg["listen"], cfg["port"], limit=limit)
     log(f"демон '{cfg['name']}' слушает {cfg['listen']}:{cfg['port']}, буфер обмена: {'да' if clip else 'нет'}")
     tasks = [server.serve_forever()]
     if clip:
@@ -999,6 +1005,9 @@ def cmd_doctor(cfg: dict) -> None:
             found = shutil.which(tool)
             ok &= bool(found)
             print(f"{'✓' if found else '✗'} {tool}")
+    for tool, what in (("gst-launch-1.0", "зеркало открытых окон"), ("lan-mouse", "общая мышь")):
+        found = shutil.which(tool) or (Path.home() / ".local/bin" / tool).exists()
+        print(f"{'✓' if found else '–'} {tool} ({what}, необязательно)")
     try:
         r = send_peer(cfg, {"cmd": "ping"}, timeout=3)
         print(f"✓ демон соседа отвечает: {r.get('name')}" if r.get("ok") else f"✗ сосед: {r.get('error')}")
@@ -1837,7 +1846,7 @@ def main() -> None:
             case "back": cmd_back(load_config(a.config), a.display)
             case "stop": cmd_stop(load_config(a.config), a.display)
             case "doctor": cmd_doctor(load_config(a.config))
-            case "stream": cmd_stream(a.xid, a.host, a.port)
+            case "stream": cmd_stream(load_config(a.config, strict=False), a.xid, a.host, a.port)
             case "view": cmd_view(a.config, a.owner, a.id, a.port, a.title, a.size or "800x600")
             case "mouse": cmd_mouse(load_config(a.config), a.config, a.action)
     except (WindriftError, OSError, subprocess.CalledProcessError) as e:
