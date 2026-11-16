@@ -541,6 +541,28 @@ def window_rect(xid: int) -> tuple[int, int, int, int]:
     return tuple(int(geo[k]) for k in ("X", "Y", "WIDTH", "HEIGHT"))
 
 
+SCREEN_MARGIN_TOP = 32   # место под заголовок окна
+
+
+def keep_on_screen(xid: int) -> bool:
+    """X11 не отдаёт картинку окна, если хоть часть его за краем экрана (BadMatch),
+    поэтому транслируемое окно держим целиком на экране. True — пришлось поправить."""
+    x, y, w, h = window_rect(xid)
+    sw, sh = map(int, run_out(["xdotool", "getdisplaygeometry"]).split())
+    nw, nh = min(w, sw), min(h, sh - SCREEN_MARGIN_TOP)
+    if (nw, nh) != (w, h):
+        subprocess.run(["xdotool", "windowsize", str(xid), str(nw), str(nh)], capture_output=True)
+        time.sleep(0.3)
+        x, y, w, h = window_rect(xid)
+    dx = -x if x < 0 else min(0, sw - (x + w))
+    dy = SCREEN_MARGIN_TOP - y if y < SCREEN_MARGIN_TOP else min(0, sh - (y + h))
+    if dx or dy:
+        subprocess.run(["xdotool", "windowmove", "--relative", "--", str(xid), str(dx), str(dy)],
+                       capture_output=True)
+        time.sleep(0.3)
+    return bool(dx or dy or (nw, nh) != (w, h))
+
+
 def window_title(xid: int) -> str:
     try:
         return run_out(["xdotool", "getwindowname", str(xid)]).strip()
@@ -574,10 +596,12 @@ def cmd_stream(cfg: dict, xid: int, host: str, port: int) -> None:
     if not shutil.which("gst-launch-1.0"):
         raise WindriftError("нет GStreamer: windrift setup-peer поставит его соседу; "
                             "здесь — gstreamer, gst-plugins-good/ugly/libav")
-    proc, size = None, None
+    proc, size, fails = None, None, 0
     try:
         while True:
             try:
+                if keep_on_screen(xid):
+                    log(f"окно {xid:#x} выходило за край экрана — вернул, иначе захват невозможен")
                 _, _, w, h = window_rect(xid)
             except (WindriftError, subprocess.TimeoutExpired):
                 log(f"окно {xid:#x} закрыто — трансляция окончена")
@@ -590,7 +614,14 @@ def cmd_stream(cfg: dict, xid: int, host: str, port: int) -> None:
                 if proc and proc.poll() is None:
                     proc.terminate()
                     proc.wait(timeout=5)
+                crashed = proc is not None and (w, h) == size
                 size = (w, h)
+                if crashed:
+                    fails += 1
+                    if fails in (3, 10) or fails % 30 == 0:
+                        log(f"захват окна {xid:#x} падает {fails} раз подряд — см. ошибку GStreamer выше")
+                else:
+                    fails = 0
                 proc = subprocess.Popen(stream_pipeline(xid, w, h, host, port),
                                         stdin=subprocess.DEVNULL)
                 log(f"трансляция {xid:#x} {w}x{h} → {host}:{port}")
@@ -640,8 +671,10 @@ def stream_resize(xid: int, w: int, h: int) -> None:
     if str(xid) not in streams_load() or session_kind() != "x11":
         return
     sw, sh = map(int, run_out(["xdotool", "getdisplaygeometry"]).split())
-    w, h = max(200, min(w, sw)), max(150, min(h, sh))
+    w, h = max(200, min(w, sw)), max(150, min(h, sh - SCREEN_MARGIN_TOP))
     subprocess.run(["xdotool", "windowsize", str(xid), str(w), str(h)], capture_output=True)
+    time.sleep(0.3)
+    keep_on_screen(xid)
     log(f"окно {xid:#x}: размер под копию {w}x{h}")
 
 
