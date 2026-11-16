@@ -19,6 +19,7 @@ sharing=no сам отключает старого клиента). Цепоч�
   windrift daemon               демон: принимает окна и синхронизирует буфер обмена
   windrift list                 показать локальные сессии
   windrift stop <N>             остановить сессию :N
+  windrift up | down | status   запустить / остановить / показать всё на обеих машинах
   windrift doctor               проверить зависимости и связь с соседом
   windrift mouse [stop|setup]   общая мышь и клавиатура в обе стороны (lan-mouse; setup — собрать и настроить)
 """
@@ -1558,6 +1559,78 @@ def cmd_mouse(cfg: dict, config_path: Path, action: str) -> None:
           "\nОстановить: windrift mouse stop")
 
 
+# ───────────────────────── запуск и состояние всего сразу ─────────────────────────
+# windrift up / down / status: демон windrift и lan-mouse на обеих машинах.
+# Про каждую программу отдельно: работает или нет, и если нет — конец её лога.
+
+# Выполняется на любой из машин (здесь — напрямую, у соседа — по ssh). $1 = up | down | status
+UPDOWN_SH = SESSION_ENV_SH + r"""
+act="$1"; me="$(id -u)"
+run="${XDG_RUNTIME_DIR:-/tmp}/windrift"; mkdir -p "$run"
+wd="$HOME/.local/bin/windrift"; lm="$HOME/.local/bin/lan-mouse"
+[ -x "$lm" ] || lm="$(command -v lan-mouse || true)"
+is_daemon() { pgrep -u "$me" -f 'windrift (--config [^ ]+ )?daemon' >/dev/null; }
+is_mouse()  { pgrep -u "$me" -x lan-mouse >/dev/null; }
+report() {  # имя, работает?, лог, пояснение
+  if [ "$2" = yes ]; then echo "  ✓ $1"; else
+    echo "  ✗ $1${4:+ — $4}"
+    [ -s "$3" ] && { echo "    последние строки $3:"; tail -n 6 "$3" | sed 's/^/      /'; }
+  fi
+}
+if [ "$act" = down ]; then
+  pkill -u "$me" -f 'windrift (--config [^ ]+ )?daemon'; pkill -u "$me" -x lan-mouse
+  sleep 0.5; echo "  остановлено"; exit 0
+fi
+if [ "$act" = up ]; then
+  if [ "$kind" = нет ]; then echo "  ✗ графическая сессия не найдена — войди на рабочий стол"; exit 0; fi
+  if ! is_daemon; then
+    if [ -x "$wd" ]; then setsid -f "$wd" daemon >"$run/daemon.log" 2>&1 </dev/null; else echo "нет $wd" >"$run/daemon.log"; fi
+  fi
+  if ! is_mouse && [ -n "$lm" ] && [ -s "${XDG_CONFIG_HOME:-$HOME/.config}/lan-mouse/config.toml" ]; then
+    RUST_LOG=info setsid -f "$lm" daemon >"$run/lan-mouse.log" 2>&1 </dev/null
+  fi
+  sleep 2
+fi
+is_daemon && d=yes || d=no
+report "windrift daemon" $d "$run/daemon.log" "не запущен"
+if [ -z "$lm" ]; then echo "  – lan-mouse не установлен (общая мышь: windrift mouse setup)"
+elif [ ! -s "${XDG_CONFIG_HOME:-$HOME/.config}/lan-mouse/config.toml" ]; then echo "  – lan-mouse не настроен (windrift mouse setup)"
+else is_mouse && m=yes || m=no; report "lan-mouse (общая мышь)" $m "$run/lan-mouse.log" "не запущен"; fi
+v="$(cd "$HOME/Linux-window-drift" 2>/dev/null && git log -1 --format='%h %s' 2>/dev/null | cut -c1-60)"
+cmp -s "$wd" "$HOME/Linux-window-drift/windrift" 2>/dev/null && inst="установлена" || inst="УСТАНОВЛЕННАЯ ОТЛИЧАЕТСЯ от папки проекта"
+echo "  версия: ${v:-?} ($inst), сессия: $kind"
+"""
+
+
+def cmd_updown(cfg: dict, action: str) -> None:
+    step(f"{cfg['name']} (эта машина)")
+    subprocess.run(["bash", "-s", action], input=UPDOWN_SH, text=True)
+    step(f"{cfg['peer']['name']} (сосед, {cfg['peer']['ssh']})")
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", cfg["peer"]["ssh"],
+                        f"bash -s {action}"], input=UPDOWN_SH, text=True)
+    if r.returncode != 0:
+        print("  ✗ до соседа не достучаться по ssh (выключен, спит или не в сети)")
+    if action == "down":
+        return
+    step("связь")
+    try:
+        reply = send_peer(cfg, {"cmd": "ping"}, timeout=3)
+        print(f"  ✓ демон соседа отвечает: {reply.get('name')}" if reply.get("ok")
+              else f"  ✗ демон соседа: {reply.get('error')}")
+    except (OSError, WindriftError) as e:
+        print(f"  ✗ демон соседа не отвечает: {e}")
+    sessions = alive_sessions()
+    streams, views = streams_load(), views_load()
+    if sessions or streams or views:
+        step("окна")
+        for n in sessions:
+            print(f"  :{n}  программа из windrift run")
+        for xid, info in streams.items():
+            print(f"  {int(xid):#x}  транслируется соседу: {info.get('title')}")
+        for vid, info in views.items():
+            print(f"  {int(vid):#x}  копия окна с {info.get('owner')}")
+
+
 # ───────────────────────── окно настроек ─────────────────────────
 
 TERMINALS = [  # (бинарь, как передать команду)
@@ -1819,6 +1892,9 @@ def main() -> None:
     p_stop = sub.add_parser("stop", help="остановить сессию")
     p_stop.add_argument("display", type=int)
     sub.add_parser("doctor", help="проверить окружение")
+    sub.add_parser("up", help="запустить всё на обеих машинах: демон windrift и общую мышь")
+    sub.add_parser("down", help="остановить всё на обеих машинах")
+    sub.add_parser("status", help="что запущено на обеих машинах")
     p_stream = sub.add_parser("stream", help=argparse.SUPPRESS)
     p_stream.add_argument("xid", type=int)
     p_stream.add_argument("host")
@@ -1846,6 +1922,7 @@ def main() -> None:
             case "back": cmd_back(load_config(a.config), a.display)
             case "stop": cmd_stop(load_config(a.config), a.display)
             case "doctor": cmd_doctor(load_config(a.config))
+            case "up" | "down" | "status": cmd_updown(load_config(a.config), a.cmd)
             case "stream": cmd_stream(load_config(a.config, strict=False), a.xid, a.host, a.port)
             case "view": cmd_view(a.config, a.owner, a.id, a.port, a.title, a.size or "800x600")
             case "mouse": cmd_mouse(load_config(a.config), a.config, a.action)
