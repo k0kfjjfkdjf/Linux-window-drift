@@ -1847,7 +1847,8 @@ test -f "$d/lan-mouse/x11-input-capture.patch" && echo "патчи на мест
     # сосед качает Rust и crates через SOCKS-туннель на эту машину; штамп проверяет сам скрипт
     env = (f"SOCKS={sport} COMMIT={commit} UPSTREAM={LANMOUSE_UPSTREAM} FEATURES={features} "
            f"STAMP_ID={shlex.quote(f'{stamp}:{features}')} "
-           f"PATCHES={shlex.quote(' '.join(f'{peer_repo}/lan-mouse/{n}' for n in LANMOUSE_PATCH_NAMES))}")
+           # двойные кавычки: в путях стоит $HOME соседа, он должен раскрыться у него
+           f"PATCHES=\"{' '.join(f'{peer_repo}/lan-mouse/{n}' for n in LANMOUSE_PATCH_NAMES)}\"")
     remote_bash(target, "export " + env + "\n" + LANMOUSE_BUILD_SH, tty=True, socks_port=sport)
 
     step("3/5 сертификаты и отпечатки")
